@@ -2,6 +2,7 @@ import { rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createLease, removeLease } from "./leases.js";
+import { listRecords } from "./metadata.js";
 import {
   bringTargetIntoWorktree,
   commitWorktreeChanges,
@@ -14,7 +15,6 @@ import { reportCmuxCwd, reportTerminalCwd } from "./terminal.js";
 import {
   describeLoss,
   findCurrentManaged,
-  findManaged,
   formatWorktreeIdentity,
   listManaged,
   planRemoval,
@@ -233,6 +233,37 @@ function parseNameAndFlags(args: string, knownFlags: readonly string[]): { name:
   return { name: names[0] ?? "", flags };
 }
 
+/** Structurally Pi's AutocompleteItem, which lives in a package this one does not depend on. */
+interface CompletionItem {
+  value: string;
+  label: string;
+  description?: string;
+}
+
+/**
+ * Suggest managed worktree names for the argument being typed.
+ *
+ * Pi passes everything after the command name and replaces all of it with the chosen value,
+ * so anything typed before the name (only flags are allowed there) is kept in the value.
+ */
+async function nameCompletions(cwd: string, typed: string, options: { includeCurrent: boolean }): Promise<CompletionItem[] | null> {
+  const split = typed.search(/\S*$/);
+  const before = typed.slice(0, split);
+  const partial = typed.slice(split);
+  if (before.split(/\s+/).some((word) => word.length > 0 && !word.startsWith("-"))) return null; // A name is already there.
+  if (partial.startsWith("-")) return null;
+  try {
+    const repo = await resolveRepository(cwd);
+    const items = (await listRecords(repo.commonDir))
+      .flatMap((item) => item.record ? [item.record] : [])
+      .filter((record) => record.name.startsWith(partial) && (options.includeCurrent || record.path !== repo.sourceRoot))
+      .map((record) => ({ value: `${before}${record.name}`, label: record.name, description: `created ${record.createdAt.slice(0, 10)}` }));
+    return items.length > 0 ? items : null;
+  } catch {
+    return null; // Not in a repository, or unreadable metadata: just offer nothing.
+  }
+}
+
 function describeRemoval(result: RemovalResult): string {
   const branch = result.branchDeleted ? ` and branch ${result.record.branch}` : "";
   const remote = result.remoteBranches.length > 0 ? ` Remote branch ${result.remoteBranches.join(", ")} was left in place.` : "";
@@ -244,7 +275,7 @@ async function reportConflict(ctx: ExtensionCommandContext, plan: MergePlan, fil
   const conflict = `${branch} conflicts with ${plan.target} in ${files.join(", ")}. ${plan.target} was left unchanged.`;
   const retry = inside
     ? `Commit the resolution, then run /worktree-merge ${name} again.`
-    : `Use /worktree-switch ${name} to work on them, commit the resolution, then run /worktree-merge ${name} again.`;
+    : `Use /worktree ${name} to work on them, commit the resolution, then run /worktree-merge ${name} again.`;
   if (!ctx.hasUI) {
     ctx.ui.notify(`${conflict} To resolve them, merge ${plan.target} into the worktree and fix the conflicts there. ${retry}`, "warning");
     return;
@@ -266,8 +297,13 @@ async function reportConflict(ctx: ExtensionCommandContext, plan: MergePlan, fil
 }
 
 export default function piWorktreeExtension(pi: ExtensionAPI): void {
+  // Pi calls argument completion without a context, so remember the session's directory.
+  let sessionCwd: string | undefined;
+  const complete = (typed: string, includeCurrent: boolean) => nameCompletions(sessionCwd ?? process.cwd(), typed, { includeCurrent });
+
   pi.registerCommand("worktree", {
-    description: "Create or enter a managed Git worktree",
+    description: "Switch to a managed Git worktree, creating it if it does not exist",
+    getArgumentCompletions: (typed) => complete(typed, false),
     handler: async (args, ctx) => {
       let execute: (() => Promise<void>);
       let prepared: PreparedWorktree | undefined;
@@ -296,40 +332,6 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
         if (prepared) {
           if (prepared.record.name !== sourceLeaseName) await removeLease(prepared.repo.commonDir, prepared.record.name).catch(() => undefined);
           if (prepared.created) await rollbackCreated(prepared);
-        }
-        ctx.ui.notify(errorMessage(error), "error");
-        return;
-      }
-      await execute();
-    },
-  });
-
-  pi.registerCommand("worktree-switch", {
-    description: "Switch to an existing managed Git worktree",
-    handler: async (args, ctx) => {
-      let execute: (() => Promise<void>);
-      let commonDir: string | undefined;
-      let sourceLeaseName: string | undefined;
-      let targetLeaseName: string | undefined;
-      let targetLeaseCreated = false;
-      try {
-        const name = args.trim();
-        if (!name) throw new Error("Usage: /worktree-switch <name>");
-        const source = await captureSource(ctx);
-        const repo = await resolveRepository(source.cwd);
-        commonDir = repo.commonDir;
-        sourceLeaseName = (await findCurrentManaged(repo))?.name;
-        const target = await findManaged(repo, name);
-        targetLeaseName = target.name;
-        await createLease(repo.commonDir, target.name);
-        targetLeaseCreated = true;
-        execute = await buildSessionTransition(ctx, source, target.path, "enter", {
-          ...(sourceLeaseName ? { sourceLeaseName } : {}),
-          targetLeaseName: target.name,
-        });
-      } catch (error) {
-        if (targetLeaseCreated && commonDir && targetLeaseName && targetLeaseName !== sourceLeaseName) {
-          await removeLease(commonDir, targetLeaseName).catch(() => undefined);
         }
         ctx.ui.notify(errorMessage(error), "error");
         return;
@@ -367,6 +369,7 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("worktree-remove", {
     description: "Delete a managed worktree and its branch (asks first if work would be lost; --force skips asking)",
+    getArgumentCompletions: (typed) => complete(typed, false),
     handler: async (args, ctx) => runCommand(ctx, async () => {
       const { name, flags } = parseNameAndFlags(args, ["--force", "-f"]);
       if (!name) throw new Error("Usage: /worktree-remove <name> [--force]");
@@ -394,6 +397,7 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
 
   pi.registerCommand("worktree-merge", {
     description: "Squash-merge a managed worktree into the main checkout's branch, then delete the worktree and its branch",
+    getArgumentCompletions: (typed) => complete(typed, true),
     handler: async (args, ctx) => {
       let execute: (() => Promise<void>) | undefined;
       let summary: string | undefined;
@@ -481,6 +485,7 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionCwd = ctx.cwd;
     try {
       const repo = await resolveRepository(ctx.cwd);
       const current = await findCurrentManaged(repo);

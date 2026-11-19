@@ -11,6 +11,7 @@ import { prepareWorktree, resolveRepository } from "../src/worktrees.js";
 
 interface RegisteredCommand {
   handler: (args: string, ctx: ExtensionCommandContext) => Promise<void>;
+  getArgumentCompletions?: (typed: string) => Promise<Array<{ value: string; label: string; description?: string }> | null>;
 }
 
 type EventHandler = (event: unknown, ctx: ExtensionCommandContext) => Promise<void>;
@@ -100,7 +101,7 @@ test("registers commands and switches from the exact non-final active leaf using
   process.env.PI_CODING_AGENT_SESSION_DIR = fixture.sessions;
   try {
     const { commands, events } = registerExtension();
-    assert.deepEqual([...commands.keys()].sort(), ["worktree", "worktree-exit", "worktree-list", "worktree-merge", "worktree-remove", "worktree-switch"]);
+    assert.deepEqual([...commands.keys()].sort(), ["worktree", "worktree-exit", "worktree-list", "worktree-merge", "worktree-remove"]);
     assert.ok(events.has("session_start"));
     assert.ok(events.has("session_shutdown"));
 
@@ -185,7 +186,7 @@ test("registers commands and switches from the exact non-final active leaf using
   }
 });
 
-test("worktree-switch enters only an existing managed worktree", { concurrency: false }, async () => {
+test("worktree enters an existing managed worktree without creating one and rejects mismatched metadata", { concurrency: false }, async () => {
   const fixture = await makeRepository();
   const previousSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR;
   process.env.PI_CODING_AGENT_SESSION_DIR = fixture.sessions;
@@ -205,26 +206,25 @@ test("worktree-switch enters only an existing managed worktree", { concurrency: 
     };
     const ctx = makeContext(fixture.repo, source, notifications, switchSession, []);
 
-    await commands.get("worktree-switch")?.handler("existing", ctx);
+    const worktreesBefore = (await runGit(["worktree", "list", "--porcelain"], fixture.repo)).stdout;
+    await commands.get("worktree")?.handler("existing", ctx);
     assert.equal(SessionManager.open(switchedFile).getCwd(), target.record.path);
     assert.equal(replacementMessages.length, 1);
     assert.deepEqual(notifications, []);
+    assert.equal((await runGit(["worktree", "list", "--porcelain"], fixture.repo)).stdout, worktreesBefore);
 
     // Corrupted metadata: foo.json holds the valid record for "existing". Never enter it as foo.
     const records = join(fixture.repo, ".git", "pi-worktree", "records");
     await writeFile(join(records, "foo.json"), await readFile(join(records, "existing.json"), "utf8"));
     switchedFile = "";
-    await commands.get("worktree-switch")?.handler("foo", ctx);
+    await commands.get("worktree")?.handler("foo", ctx);
     assert.equal(switchedFile, "");
     const mismatch = (notifications as Array<{ message: string; level: string }>).at(-1);
     assert.equal(mismatch?.level, "error");
     assert.match(mismatch?.message ?? "", /record name "existing" does not match "foo"/);
     assert.deepEqual(await listLiveLeases((await resolveRepository(fixture.repo)).commonDir, "foo"), []);
     await unlink(join(records, "foo.json"));
-
-    await commands.get("worktree-switch")?.handler("missing", ctx);
-    assert.deepEqual(notifications.at(-1), { message: "No extension-managed worktree named missing", level: "error" });
-    assert.equal((await runGit(["worktree", "list", "--porcelain", "-z"], fixture.repo)).stdout.includes("/missing"), false);
+    assert.equal((await runGit(["worktree", "list", "--porcelain"], fixture.repo)).stdout, worktreesBefore);
   } finally {
     if (previousSessionDir === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
     else process.env.PI_CODING_AGENT_SESSION_DIR = previousSessionDir;
@@ -488,7 +488,7 @@ test("worktree-merge conflicts leave main alone and move the conflict into the w
     await commands.get("worktree-merge")?.handler("clash", ctx);
     assert.deepEqual(confirms, ["Conflicts merging clash"]);
     assert.deepEqual(notifications.at(-1), {
-      message: "Started merging main into worktree clash. Resolve the conflicts in README.md there. Use /worktree-switch clash to work on them, commit the resolution, then run /worktree-merge clash again.",
+      message: "Started merging main into worktree clash. Resolve the conflicts in README.md there. Use /worktree clash to work on them, commit the resolution, then run /worktree-merge clash again.",
       level: "warning",
     });
     assert.equal((await runGit(["rev-parse", "HEAD"], fixture.repo)).stdout.trim(), before);
@@ -539,6 +539,48 @@ test("worktree-merge from inside the worktree returns to the main checkout befor
     assert.match(message, /Squash-merged worktree-inside into main as [0-9a-f]{12}\. Deleted worktree inside and branch worktree-inside\./);
   } finally {
     restore();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree names are suggested as command arguments", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    const alpha = await prepareWorktree(fixture.repo, "alpha", { trustProject: false, home: fixture.home });
+    await prepareWorktree(fixture.repo, "beta", { trustProject: false, home: fixture.home });
+    await prepareWorktree(fixture.repo, "bravo", { trustProject: false, home: fixture.home });
+    // Invalid metadata is never suggested.
+    const records = join(fixture.repo, ".git", "pi-worktree", "records");
+    await writeFile(join(records, "broken.json"), "{}\n");
+    const { commands, events } = registerExtension();
+    const complete = async (command: string, typed: string) =>
+      (await commands.get(command)?.getArgumentCompletions?.(typed))?.map((item) => item.value) ?? null;
+    const start = async (cwd: string) =>
+      events.get("session_start")?.({ type: "session_start", reason: "startup" }, makeContext(cwd, SessionManager.create(cwd, fixture.sessions), [], noSwitch, []));
+
+    await start(fixture.repo);
+    assert.deepEqual(await complete("worktree", ""), ["alpha", "beta", "bravo"]);
+    assert.deepEqual(await complete("worktree", "b"), ["beta", "bravo"]);
+    assert.deepEqual(await complete("worktree", "br"), ["bravo"]);
+    assert.equal(await complete("worktree", "z"), null);
+    assert.equal(await complete("worktree", "alpha "), null);
+    const [item] = (await commands.get("worktree")?.getArgumentCompletions?.("a")) ?? [];
+    assert.match(item?.description ?? "", /^created \d{4}-\d{2}-\d{2}$/);
+    // Flags typed before the name are kept, because Pi replaces everything after the command.
+    assert.deepEqual(await complete("worktree-remove", "--force a"), ["--force alpha"]);
+    assert.equal(await complete("worktree-remove", "--fo"), null);
+    assert.deepEqual(await complete("worktree-merge", ""), ["alpha", "beta", "bravo"]);
+
+    // Inside a worktree, switching to or removing it makes no sense, but merging it does.
+    await start(join(alpha.record.path));
+    assert.deepEqual(await complete("worktree", ""), ["beta", "bravo"]);
+    assert.deepEqual(await complete("worktree-remove", ""), ["beta", "bravo"]);
+    assert.deepEqual(await complete("worktree-merge", ""), ["alpha", "beta", "bravo"]);
+
+    // Outside any repository there is nothing to suggest.
+    await start(fixture.home);
+    assert.equal(await complete("worktree", ""), null);
+  } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

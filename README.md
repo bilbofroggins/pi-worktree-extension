@@ -2,9 +2,9 @@
 
 **Run multiple Pi coding tasks in parallel — each with its own branch, files, and resumable conversation — then squash-merge the result back with one command.**
 
-This is a fork of [AjayPoshak/pi-worktree-extension](https://github.com/AjayPoshak/pi-worktree-extension). It differs from upstream in four ways:
+This is a fork of [AjayPoshak/pi-worktree-extension](https://github.com/AjayPoshak/pi-worktree-extension). It differs from upstream in these ways:
 
-- **Slash commands only.** The `pi -w` shell launcher is gone; everything happens inside Pi.
+- **Slash commands only.** The `pi -w` shell launcher is gone; everything happens inside Pi. `/worktree-switch` is gone too: `/worktree <name>` already switches to an existing worktree, and names are suggested as you type.
 - **`/worktree-merge`** squash-merges a worktree into the main checkout's branch as one commit, then deletes the worktree and its branch.
 - **`/worktree-remove` deletes the branch too**, and asks before discarding uncommitted files or unmerged commits (`--force` skips the question).
 - **Creating a worktree no longer requires a clean checkout.** Uncommitted changes in the current checkout stay where they are; you get a warning instead of an error.
@@ -41,14 +41,13 @@ my-project/
     └── add-api-tests/               worktree-add-api-tests
 ```
 
-`/worktree-switch fix-auth` from any session in the repository moves that session into the worktree. `/worktree-exit` moves it back. The conversation history travels with it.
+`/worktree fix-auth` from any session in the repository moves that session into the worktree, creating it only if it doesn't exist yet. `/worktree-exit` moves it back. The conversation history travels with it. Type `/worktree ` and existing worktree names are suggested; `/worktree-remove` and `/worktree-merge` suggest them too.
 
 ## 🎛️ Commands
 
 | Command | Description |
 | --- | --- |
-| `/worktree <name>` | Move the active conversation into a new or existing worktree |
-| `/worktree-switch <name>` | Move the active conversation into an existing worktree (never creates one) |
+| `/worktree <name>` | Move the active conversation into an existing worktree, or create it first if there is none by that name |
 | `/worktree-list` | List managed worktrees, marking ones with uncommitted changes |
 | `/worktree-exit` | Move the active conversation back to the primary checkout |
 | `/worktree-merge [name]` | Squash-merge a worktree into the primary checkout's branch, then delete it. The name is optional inside a worktree |
