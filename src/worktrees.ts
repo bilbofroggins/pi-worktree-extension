@@ -1,4 +1,4 @@
-import { open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { loadConfig, type BaseMode } from "./config.js";
@@ -152,12 +152,17 @@ async function resolveBase(mode: BaseMode, repo: RepositoryContext): Promise<{ o
   }
 }
 
-export async function validateRecord(repo: RepositoryContext, record: WorktreeRecord): Promise<WorktreeRecord> {
+/** Checks that need no filesystem access, so they also apply to a record whose checkout is gone. */
+function validateRecordLayout(repo: RepositoryContext, record: WorktreeRecord): void {
   validateSlug(record.name);
   const expectedPath = join(repo.primaryRoot, ".pi", "worktrees", record.name);
   if (record.primaryRoot !== repo.primaryRoot || record.path !== expectedPath || record.branch !== `worktree-${record.name}`) {
     throw new Error(`Metadata for ${record.name} does not match this repository's managed layout`);
   }
+}
+
+export async function validateRecord(repo: RepositoryContext, record: WorktreeRecord): Promise<WorktreeRecord> {
+  validateRecordLayout(repo, record);
   const canonicalPath = await canonicalExisting(record.path);
   const canonicalRoot = await canonicalExisting(join(repo.primaryRoot, ".pi", "worktrees"));
   if (canonicalPath !== record.path || !isContained(canonicalRoot, canonicalPath)) {
@@ -184,7 +189,7 @@ async function cleanStatus(cwd: string): Promise<boolean> {
 export interface PrepareOptions {
   trustProject: boolean;
   home?: string;
-  /** Create a lease atomically with preparation (launcher shell PID or transition process PID). */
+  /** Create a lease atomically with preparation (the transition's process PID). */
   leasePid?: number;
 }
 
@@ -217,12 +222,16 @@ export async function prepareWorktree(cwd: string, name: string, options: Prepar
     const localBranches = (await runGit(["for-each-ref", "--format=%(refname:short)", "refs/heads"], repo.sourceRoot)).stdout.split("\n").filter(Boolean);
     const collidingBranch = localBranches.find((candidate) => candidate.toLowerCase() === branch.toLowerCase());
     if (collidingBranch) throw new Error(`Branch ${collidingBranch} collides with ${branch} without a validated managed worktree`);
-    if (!(await trackedStatusClean(repo.sourceRoot))) {
-      throw new Error(`Source checkout has tracked or untracked changes: ${repo.sourceRoot}`);
-    }
 
     const config = await loadConfig(repo.primaryRoot, options.trustProject, options.home ?? homedir());
     const base = await resolveBase(config.base, repo);
+    // The new checkout starts from a commit, so uncommitted work in the source checkout is
+    // neither copied nor touched. Say so rather than refusing.
+    const warnings = base.warning ? [base.warning] : [];
+    if (!(await trackedStatusClean(repo.sourceRoot))) {
+      warnings.push(`Uncommitted changes in ${repo.sourceRoot} stay there; the new worktree starts from commit ${base.oid.slice(0, 12)}.`);
+    }
+    const warning = warnings.length > 0 ? warnings.join(" ") : undefined;
     let worktreeAdded = false;
     try {
       await runGit(["worktree", "add", "-b", branch, "--", target, base.oid], repo.sourceRoot, 60_000);
@@ -238,7 +247,7 @@ export async function prepareWorktree(cwd: string, name: string, options: Prepar
       };
       await writeRecordAtomic(repo.commonDir, record);
       if (options.leasePid !== undefined) await createLeaseUnlocked(repo.commonDir, name, options.leasePid);
-      return { repo: await resolveRepository(target), record, created: true, ...(base.warning ? { warning: base.warning } : {}) };
+      return { repo: await resolveRepository(target), record, created: true, ...(warning ? { warning } : {}) };
     } catch (originalError) {
       if (!worktreeAdded) throw originalError;
       let removalError: unknown;
@@ -314,24 +323,180 @@ export async function listManaged(repo: RepositoryContext): Promise<{ valid: Man
   return { valid, invalid };
 }
 
-export async function removeManaged(repo: RepositoryContext, name: string, activeCwd: string): Promise<WorktreeRecord> {
+/** What removing a managed worktree would discard. */
+export interface RemovalPlan {
+  record: WorktreeRecord;
+  /** Git lists the checkout, possibly as prunable because its directory is already gone. */
+  registered: boolean;
+  /** The checkout is registered and its directory exists. */
+  checkoutPresent: boolean;
+  /** Tracked changes plus non-ignored untracked files, one per porcelain line. */
+  dirtyFiles: number;
+  /** Commits on the branch that no other local branch or remote-tracking branch contains. */
+  uniqueCommits: number;
+  /** Branch tip, or undefined when the branch no longer exists. */
+  branchOid?: string;
+  /** Raw porcelain status, compared again at removal time. */
+  status: string;
+}
+
+/** The state a user saw when they agreed to lose work. Removal refuses if it changed. */
+export interface RemovalSnapshot {
+  branchOid: string | undefined;
+  status: string;
+}
+
+export interface RemovalResult {
+  record: WorktreeRecord;
+  branchDeleted: boolean;
+  /** Remote-tracking branches with the same name, which are never deleted. */
+  remoteBranches: string[];
+}
+
+export function removalSnapshot(plan: RemovalPlan): RemovalSnapshot {
+  return { branchOid: plan.branchOid, status: plan.status };
+}
+
+export function describeLoss(plan: Pick<RemovalPlan, "dirtyFiles" | "uniqueCommits">): string | undefined {
+  const parts: string[] = [];
+  if (plan.dirtyFiles > 0) parts.push(`${plan.dirtyFiles} uncommitted file change${plan.dirtyFiles === 1 ? "" : "s"}`);
+  if (plan.uniqueCommits > 0) parts.push(`${plan.uniqueCommits} commit${plan.uniqueCommits === 1 ? "" : "s"} that no other branch contains`);
+  return parts.length > 0 ? parts.join(" and ") : undefined;
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+export async function branchTip(cwd: string, branch: string): Promise<string | undefined> {
+  try {
+    return (await runGit(["rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], cwd)).stdout.trim() || undefined;
+  } catch (error) {
+    if (error instanceof GitError && error.exitCode === 1 && !error.killed) return undefined;
+    throw error;
+  }
+}
+
+async function isInsideOrEqual(root: string, candidate: string): Promise<boolean> {
+  let canonical: string;
+  try { canonical = await canonicalExisting(candidate); }
+  catch { return false; }
+  return canonical === root || isContained(root, canonical);
+}
+
+async function planRemovalUnlocked(repo: RepositoryContext, name: string, activeCwd: string): Promise<RemovalPlan> {
+  const record = await readRecord(repo.commonDir, name);
+  if (!record) throw new Error(`No extension-managed worktree named ${name}`);
+  validateRecordLayout(repo, record);
+
+  const entry = repo.worktrees.find((item) => resolve(item.path) === record.path);
+  const onDisk = await pathExists(record.path);
+  if (!entry && onDisk) {
+    throw new Error(`${record.path} exists but Git does not list it as a worktree; inspect it manually before removing it`);
+  }
+  const checkoutPresent = Boolean(entry && onDisk);
+  if (checkoutPresent) {
+    await validateRecord(repo, record);
+    if (await isInsideOrEqual(record.path, activeCwd)) {
+      throw new Error(`This session is inside worktree ${name}. Run /worktree-exit first, or /worktree-merge to merge it and leave.`);
+    }
+    if (await isInsideOrEqual(record.path, process.cwd())) {
+      throw new Error(`Pi was started from inside worktree ${name}. Quit Pi and start it from the main checkout to remove this worktree.`);
+    }
+  } else if (entry && entry.branch !== `refs/heads/${record.branch}`) {
+    throw new Error(`Git lists ${record.path} on ${entry.branch ?? "a detached HEAD"}, not ${record.branch}`);
+  }
+
+  const status = checkoutPresent
+    ? (await runGit(["status", "--porcelain=v1", "--untracked-files=all"], record.path)).stdout
+    : "";
+  const branchOid = await branchTip(repo.primaryRoot, record.branch);
+  const uniqueCommits = branchOid
+    ? Number((await runGit(
+        ["rev-list", "--count", `refs/heads/${record.branch}`, "--not", `--exclude=${record.branch}`, "--branches", "--remotes"],
+        repo.primaryRoot,
+      )).stdout.trim())
+    : 0;
+  return {
+    record,
+    registered: Boolean(entry),
+    checkoutPresent,
+    dirtyFiles: status.split("\n").filter((line) => line.length > 0).length,
+    uniqueCommits,
+    ...(branchOid ? { branchOid } : {}),
+    status,
+  };
+}
+
+/** Report what removal would discard without changing anything. */
+export async function planRemoval(repo: RepositoryContext, name: string, activeCwd: string): Promise<RemovalPlan> {
+  await validateName(name, repo.sourceRoot);
+  return withWorktreeLock(repo.commonDir, name, async () => planRemovalUnlocked(await resolveRepository(activeCwd), name, activeCwd));
+}
+
+/**
+ * Remove a managed worktree's checkout, branch, and metadata.
+ *
+ * Work that would be lost (uncommitted files, or commits no other branch contains) requires a
+ * `confirmed` snapshot from planRemoval(), and the worktree must not have changed since.
+ * A live Pi session in the worktree always blocks removal.
+ */
+export async function removeManaged(
+  repo: RepositoryContext,
+  name: string,
+  activeCwd: string,
+  options: { confirmed?: RemovalSnapshot } = {},
+): Promise<RemovalResult> {
   await validateName(name, repo.sourceRoot);
   return withWorktreeLock(repo.commonDir, name, async () => {
     const currentRepo = await resolveRepository(activeCwd);
-    const record = await readRecord(currentRepo.commonDir, name);
-    if (!record) throw new Error(`No extension-managed worktree named ${name}`);
-    await validateRecord(currentRepo, record);
-    const active = await canonicalExisting(activeCwd);
-    if (active === record.path || isContained(record.path, active)) throw new Error("Cannot remove the active worktree");
-    const leases = await listLiveLeasesUnlocked(currentRepo.commonDir, name);
-    if (leases.length > 0) {
-      const owners = leases.map((lease) => lease.pid === undefined ? `${lease.path} (${lease.detail ?? "ambiguous owner"})` : `PID ${lease.pid}`).join(", ");
-      throw new Error(`Worktree ${name} is leased by a live or ambiguous Pi process: ${owners}`);
+    const plan = await planRemovalUnlocked(currentRepo, name, activeCwd);
+    const { record } = plan;
+
+    const others = [];
+    for (const lease of await listLiveLeasesUnlocked(currentRepo.commonDir, name)) {
+      // Pi runs one session per process and this one is outside the worktree (checked above),
+      // so a lease held by this process is left over from a session that already moved on.
+      if (lease.pid === process.pid) await rm(lease.path, { force: true });
+      else others.push(lease);
     }
-    if (!(await cleanStatus(record.path))) throw new Error(`Worktree ${name} has tracked changes or untracked files; refusing removal`);
-    await runGit(["worktree", "remove", record.path], currentRepo.primaryRoot, 60_000);
+    if (others.length > 0) {
+      const owners = others.map((lease) => lease.pid === undefined ? `${lease.path} (${lease.detail ?? "ambiguous owner"})` : `PID ${lease.pid}`).join(", ");
+      throw new Error(`Worktree ${name} is in use by another Pi session: ${owners}`);
+    }
+
+    const loss = describeLoss(plan);
+    if (options.confirmed) {
+      if (options.confirmed.branchOid !== plan.branchOid || options.confirmed.status !== plan.status) {
+        throw new Error(`Worktree ${name} changed after it was checked; nothing was removed. Run the command again.`);
+      }
+    } else if (loss) {
+      throw new Error(`Worktree ${name} has ${loss}; nothing was removed`);
+    }
+
+    if (plan.registered) await runGit(["worktree", "remove", "--force", record.path], currentRepo.primaryRoot, 60_000);
+    if (plan.branchOid) {
+      try {
+        // Compare-and-delete: only the tip that was checked is removed.
+        await runGit(["update-ref", "-d", `refs/heads/${record.branch}`, plan.branchOid], currentRepo.primaryRoot);
+      } catch (error) {
+        throw new Error(
+          `Removed checkout ${record.path}, but branch ${record.branch} was kept: ${error instanceof Error ? error.message : String(error)}. ` +
+          `Metadata remains at ${recordPath(currentRepo.commonDir, name)}.`,
+          { cause: error },
+        );
+      }
+    }
     await removeRecord(currentRepo.commonDir, name);
-    return record;
+    const remoteBranches = (await runGit(["for-each-ref", "--format=%(refname:short)", `refs/remotes/*/${record.branch}`], currentRepo.primaryRoot))
+      .stdout.split("\n").filter((line) => line.length > 0);
+    return { record, branchDeleted: Boolean(plan.branchOid), remoteBranches };
   });
 }
 

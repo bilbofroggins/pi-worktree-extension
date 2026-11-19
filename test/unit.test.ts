@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isPersistentlyTrusted, loadConfig, testing as configTesting } from "../src/config.js";
+import { loadConfig, testing as configTesting } from "../src/config.js";
 import { parseRecord, readRecord, writeRecordAtomic, type WorktreeRecord } from "../src/metadata.js";
 import { isContained } from "../src/paths.js";
 import { parseWorktreePorcelain } from "../src/porcelain.js";
@@ -89,18 +89,6 @@ test("config layers trusted project over global and validates values", async () 
     assert.deepEqual(await loadConfig(repo, false, home), { base: "head" });
     assert.deepEqual(await loadConfig(repo, true, home), { base: "fresh" });
     assert.throws(() => configTesting.parseConfig('{"base":"network"}', "test"), /fresh.*head/);
-  } finally { await rm(root, { recursive: true, force: true }); }
-});
-
-test("persisted trust uses exact/ancestor booleans and ignores non-boolean entries", async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-worktree-trust-"));
-  const home = join(root, "home");
-  try {
-    await mkdir(join(home, ".pi", "agent"), { recursive: true });
-    await writeFile(join(home, ".pi", "agent", "trust.json"), JSON.stringify({ "/repo": true, "/repo/denied": false, "/other": "yes" }));
-    assert.equal(await isPersistentlyTrusted("/repo/project", home), true);
-    assert.equal(await isPersistentlyTrusted("/repo/denied/child", home), false);
-    assert.equal(await isPersistentlyTrusted("/other", home), false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

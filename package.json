@@ -23,15 +23,11 @@
   "type": "module",
   "license": "MIT",
   "files": [
-    "bin",
     "dist/src",
     "src",
     "README.md",
     "LICENSE"
   ],
-  "bin": {
-    "pi-worktree": "bin/pi-worktree"
-  },
   "pi": {
     "extensions": [
       "./src/extension.ts"

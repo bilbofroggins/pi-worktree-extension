@@ -87,7 +87,7 @@ export async function createLeaseUnlocked(commonDir: string, name: string, pid: 
     if (existing.isSymbolicLink() || !existing.isFile()) throw new Error(`Lease path is not a regular file: ${destination}`);
     const parsed = JSON.parse(await readFile(destination, "utf8")) as Partial<LeaseRecord>;
     if (parsed.version !== 1 || parsed.name !== name || parsed.pid !== pid) throw new Error(`Existing lease is malformed: ${destination}`);
-    return; // Adopt a launcher-created lease owned by the same exec-preserved PID.
+    return; // Adopt the lease this PID already holds.
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }

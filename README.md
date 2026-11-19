@@ -1,181 +1,87 @@
-# 🌳 Pi Worktree
+# 🌳 Pi Worktree (fork)
 
-[![npm](https://img.shields.io/npm/v/pi-worktree-extension?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/pi-worktree-extension)
-[![npm weekly downloads](https://img.shields.io/npm/dw/pi-worktree-extension?style=for-the-badge&logo=npm)](https://www.npmjs.com/package/pi-worktree-extension)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge)](LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/AjayPoshak/pi-worktree-extension?style=for-the-badge&logo=github)](https://github.com/AjayPoshak/pi-worktree-extension/stargazers)
+**Run multiple Pi coding tasks in parallel — each with its own branch, files, and resumable conversation — then squash-merge the result back with one command.**
 
-**Run multiple Pi coding tasks in parallel — each with its own branch, files, and resumable conversation.**
+This is a fork of [AjayPoshak/pi-worktree-extension](https://github.com/AjayPoshak/pi-worktree-extension). It differs from upstream in four ways:
 
-[Project site](https://ajayposhak.github.io/pi-worktree-extension/) · [npm](https://www.npmjs.com/package/pi-worktree-extension)
-
-No shell configuration is required:
-
-```bash
-pi install npm:pi-worktree-extension
-cd ~/code/my-project
-pi
-```
-
-Then create an isolated task from inside Pi:
-
-```text
-/worktree fix-auth
-```
-
-Start `fix-pagination` and `add-api-tests` in other terminals too — no stashing, no collisions, and no waiting your turn.
-
-## ✨ What makes Pi Worktree different
-
-Pi Worktree focuses on keeping the **Pi conversation** and the **Git worktree** together:
-
-- **Resume by task name** — reopen a worktree and continue its latest Pi session.
-- **Move existing conversations** — `/worktree fix-auth` carries the active conversation into isolation instead of making you start over.
-- **Optional shell launcher** — use `pi -w fix-auth` when you want to start isolated sessions directly from your terminal.
-- **Conservative lifecycle** — removal requires a clean, inactive checkout; branches are kept and nothing is force-deleted.
-
-It is intentionally focused on Pi session and worktree lifecycle rather than becoming a general Git or pull-request manager.
-
-## 🤔 Why worktrees
-
-A single checkout can't hold two tasks at once — two Pi sessions in the same directory step on each other's edits. Git worktrees fix that natively, but the raw workflow (branch, create, `cd`, launch, track, clean up) is tedious. Pi Worktree collapses it into one command:
-
-| Task | Pi Worktree | Manual workflow |
-| --- | --- | --- |
-| Start an isolated task | `pi -w fix-auth` | `git worktree add -b worktree-fix-auth .pi/worktrees/fix-auth && cd .pi/worktrees/fix-auth && pi` |
-| Move the active conversation | `/worktree fix-auth` | Create the worktree, launch a new session, re-establish context by hand |
-| Return to the primary checkout | `/worktree-exit` | Find the primary checkout and relaunch or resume Pi there |
-| See every managed task | `/worktree-list` | Combine `git worktree list` with manual status checks |
-| Remove a finished checkout | `/worktree-remove fix-auth` | Verify it's inactive and clean, then `git worktree remove` |
-
-Branches are always kept, even after removal — Pi Worktree never force-removes a checkout or force-deletes a branch.
+- **Slash commands only.** The `pi -w` shell launcher is gone; everything happens inside Pi.
+- **`/worktree-merge`** squash-merges a worktree into the main checkout's branch as one commit, then deletes the worktree and its branch.
+- **`/worktree-remove` deletes the branch too**, and asks before discarding uncommitted files or unmerged commits (`--force` skips the question).
+- **Creating a worktree no longer requires a clean checkout.** Uncommitted changes in the current checkout stay where they are; you get a warning instead of an error.
 
 ## 🚀 Install
 
-**Requirements:** Pi (tested with 0.83.0), Node.js 22.19+, Git worktree support, a non-bare repo with at least one commit.
+**Requirements:** Pi (tested with 0.83.0 and 1.5.2), Node.js 22.19+, a non-bare Git repository with at least one commit.
 
 ```bash
-pi install npm:pi-worktree-extension
-```
-
-That immediately adds the `/worktree` commands to your session:
-
-```bash
-cd ~/code/my-project
-pi
-```
-
-```text
-/worktree feature-auth
-```
-
-Pi extensions run with your user permissions — review the source before installing packages you don't trust.
-
-### Optional: enable `pi -w` from the shell
-
-`/worktree` works out of the box. For the `pi -w feature-auth` shortcut, add a small dispatcher (Pi picks its startup directory before extensions load, so this can't be done from inside the extension):
-
-```bash
-command -v pi   # copy this path for the next step
-```
-
-Add to `~/.zshrc` or `~/.bashrc`:
-
-```bash
-export PI_WORKTREE_REAL_PI="/absolute/path/to/pi"   # from `command -v pi` above
-export PI_WORKTREE_LAUNCHER="$HOME/.pi/agent/npm/node_modules/.bin/pi-worktree"
-
-pi() {
-  case "${1-}" in
-    -w|--worktree)
-      if (($# < 2)); then
-        echo "usage: pi -w <name> [Pi args...]" >&2
-        return 2
-      fi
-      shift
-      command "$PI_WORKTREE_LAUNCHER" "$@"
-      ;;
-    *)
-      command "$PI_WORKTREE_REAL_PI" "$@"
-      ;;
-  esac
-}
-```
-
-```bash
-source ~/.zshrc   # or ~/.bashrc
-pi --version
-```
-
-<details>
-<summary><strong>Install from source</strong></summary>
-
-```bash
-git clone https://github.com/AjayPoshak/pi-worktree-extension.git
+git clone https://github.com/bilbofroggins/pi-worktree-extension.git
 cd pi-worktree-extension
 npm ci
-npm run typecheck
 npm test
 pi install "$PWD"
 ```
 
-Point the launcher at the cloned package instead:
+Pi extensions run with your user permissions — review the source before installing packages you don't trust.
 
-```bash
-export PI_WORKTREE_LAUNCHER="/absolute/path/to/pi-worktree-extension/bin/pi-worktree"
+## ⚡ Workflow
+
+```text
+/worktree fix-auth        move this conversation into a new worktree on branch worktree-fix-auth
+   … work with the agent …
+/worktree-merge           squash fix-auth into main, return to the main checkout, delete the worktree
 ```
 
-</details>
-
-## ⚡ Quick start
-
-Start isolated tasks from separate terminals:
-
-```bash
-pi -w feature-auth
-pi -w fix-pagination
-pi -w add-api-tests
-```
-
-Each one gets its own files, branch, and session history:
+Each task gets its own files, branch, and session history:
 
 ```text
 my-project/
 ├── primary checkout                 main
 └── .pi/worktrees/
-    ├── feature-auth/                worktree-feature-auth
-    ├── fix-pagination/              worktree-fix-pagination
+    ├── fix-auth/                    worktree-fix-auth
     └── add-api-tests/               worktree-add-api-tests
 ```
 
-Running `pi -w feature-auth` again reopens that checkout and resumes its latest session.
+`/worktree-switch fix-auth` from any session in the repository moves that session into the worktree. `/worktree-exit` moves it back. The conversation history travels with it.
 
-Already mid-conversation? `/worktree feature-auth` moves it — full history included — into an isolated checkout instead of making you start over. `/worktree-exit` brings it back.
-
-## 🎛️ Core commands
+## 🎛️ Commands
 
 | Command | Description |
 | --- | --- |
-| `pi -w <name> [Pi args...]` | Create or reopen a task worktree and continue its latest session |
-| `pi --worktree <name> [Pi args...]` | Long form of `pi -w` |
 | `/worktree <name>` | Move the active conversation into a new or existing worktree |
 | `/worktree-switch <name>` | Move the active conversation into an existing worktree (never creates one) |
-| `/worktree-list` | List managed worktree names and branch names |
+| `/worktree-list` | List managed worktrees, marking ones with uncommitted changes |
 | `/worktree-exit` | Move the active conversation back to the primary checkout |
-| `/worktree-remove <name>` | Remove an inactive, clean checkout and keep its branch |
+| `/worktree-merge [name]` | Squash-merge a worktree into the primary checkout's branch, then delete it. The name is optional inside a worktree |
+| `/worktree-remove <name> [--force]` | Delete a worktree and its branch. Asks first if work would be lost; `--force` (or `-f`) skips the question |
 
-Names match `[a-z0-9][a-z0-9-]{0,47}` — e.g. `fix-auth`, `issue-123`, `prototype2`. `pi -w` supplies `--continue` itself; forward other Pi arguments freely, but not another resume/continue selector.
+Names match `[a-z0-9][a-z0-9-]{0,47}` — e.g. `fix-auth`, `issue-123`, `prototype2`.
 
-## 🛡️ Safety by default
+## 🔀 How `/worktree-merge` works
 
-- New worktrees branch from local `origin/HEAD` (never fetched — falls back to `HEAD` with a warning if `origin/HEAD` isn't available). Prefer `HEAD` instead? Set `{ "base": "head" }` in `~/.pi/agent/worktree.json` or `<repository>/.pi/worktree.json`.
-- Creating a worktree requires a clean source checkout. Removal is blocked by tracked changes, non-ignored untracked files, or while another Pi process is using it. Ignored files are deleted with the checkout, matching `git worktree remove`.
-- Dirty worktrees can always be reopened — unfinished work is never stranded.
-- Quitting Pi never removes a checkout. `/worktree-remove` never deletes the branch. There is no force mode.
+The merge target is whatever branch the **primary checkout** (the original clone, not a worktree) has checked out — usually `main`.
+
+1. **Checks.** The primary checkout must be on a branch, have no uncommitted changes to tracked files, and have no merge or rebase in progress. Untracked files there are fine. No other Pi session may be using the worktree.
+2. **Asks.** If the worktree has uncommitted changes, it asks whether to commit them. It then opens an editor with a suggested commit message (a single commit's own message, or a list of commit subjects). Cancelling either question changes nothing.
+3. **Squashes.** It commits any uncommitted worktree changes, runs `git merge --squash worktree-<name>` in the primary checkout, and commits the result as **one** new commit. Commit hooks run as usual. If a hook fails, the primary checkout is restored.
+4. **Cleans up.** It deletes the worktree and its branch. If you ran the command from inside that worktree, the session first moves back to the primary checkout.
+
+**Conflicts.** If the squash conflicts, the primary checkout is restored immediately (`git reset --merge`) and nothing is committed. You're offered the option of merging the target branch into the worktree so you can resolve the conflicts there. Resolve them (or ask the agent to), commit, and run `/worktree-merge` again.
+
+**Why tracked changes in the primary checkout block a merge:** Git's own documentation warns that backing out of a merge may not reconstruct uncommitted changes that were there beforehand, so the extension refuses rather than risk them.
+
+**Squash means the branch is never "merged" in Git's eyes.** Its individual commits don't appear in the target's history, so `git branch -d` would refuse to delete it. The merge command deletes it for you. If you push `worktree-*` branches yourself, remote branches are left alone and mentioned in the result.
+
+## 🛡️ Safety
+
+- New worktrees branch from local `origin/HEAD` (never fetched — falls back to `HEAD` with a warning if `origin/HEAD` isn't available). Prefer `HEAD`? Set `{ "base": "head" }` in `~/.pi/agent/worktree.json` or `<repository>/.pi/worktree.json`.
+- **Removal asks first** when it would discard uncommitted files (tracked or untracked) or commits that no other local or remote-tracking branch contains. If the worktree changes between the question and the deletion, nothing is deleted. Ignored files (build output, `node_modules`) are deleted without asking, matching `git worktree remove`.
+- A worktree that another live Pi session is using can't be removed or merged, even with `--force`. A session can't remove the worktree it's in: use `/worktree-exit` first, or `/worktree-merge`, which handles that for you.
+- If a worktree's directory was deleted by hand, `/worktree-remove` still cleans up the branch, Git's worktree entry, and the extension's metadata.
+- Quitting Pi never removes a checkout.
 
 Worktrees isolate files, not permissions — every Pi process still runs with your own user access against the same repository.
 
-**Not (yet) included:** automatic fetch/remote branch management, automatic branch deletion or rename, copying ignored/dependency files into new worktrees. A hard crash can leave a conservative lock behind — safe to inspect once you've confirmed no Pi process holds that worktree.
+**Not included:** fetching or pushing, copying ignored/dependency files into new worktrees. A hard crash can leave a lock file behind; it's safe to delete once you've confirmed no Pi process is using that worktree.
 
 ## 🧹 Uninstall
 
@@ -184,26 +90,19 @@ Worktrees isolate files, not permissions — every Pi process still runs with yo
 ```
 
 ```bash
-pi remove npm:pi-worktree-extension
+pi remove /absolute/path/to/pi-worktree-extension
 ```
 
-Then drop the dispatcher function and the `PI_WORKTREE_REAL_PI` / `PI_WORKTREE_LAUNCHER` variables from your shell config. Uninstalling never touches existing worktrees or `worktree-*` branches.
+Uninstalling never touches existing worktrees or `worktree-*` branches.
 
-## 💬 Community
-
-Share a workflow, ask a question, or suggest an improvement in [GitHub Discussions](https://github.com/AjayPoshak/pi-worktree-extension/discussions). Have a useful setup to show others? [Open a show-and-tell](https://github.com/AjayPoshak/pi-worktree-extension/issues/new?template=show-and-tell.yml).
-
-## 🤝 Contributing
-
-Issues and small friction reports are welcome: [open an issue](https://github.com/AjayPoshak/pi-worktree-extension/issues/new).
+## 🤝 Development
 
 ```bash
 npm ci
 npm run typecheck
 npm test
-npm pack --dry-run
 ```
 
 ## 📄 License
 
-[MIT](LICENSE)
+[MIT](LICENSE). Original work by [AjayPoshak](https://github.com/AjayPoshak).

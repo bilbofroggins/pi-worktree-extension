@@ -43,17 +43,30 @@ async function makeRepository(): Promise<{ root: string; repo: string; home: str
   return { root, repo, home, sessions };
 }
 
+interface DialogAnswers {
+  /**
+   * Answer for each confirm dialog by title; unlisted titles answer false. Select dialogs list
+   * the safe choice first and the action last, so true picks the last entry and false the first.
+   */
+  confirm?: (title: string) => boolean;
+  /** Result of the editor dialog; defaults to cancelling. */
+  editor?: (title: string, prefill: string | undefined) => string | undefined;
+}
+
 function makeContext(
   cwd: string,
   manager: SessionManager,
   notifications: Array<{ message: string; level: string }>,
   switchSession: ExtensionCommandContext["switchSession"],
   confirms: string[],
+  answers: DialogAnswers = {},
 ): ExtensionCommandContext {
   const ui = {
     notify(message: string, level: string) { notifications.push({ message, level }); },
     setStatus() {},
-    confirm(title: string) { confirms.push(title); return Promise.resolve(false); },
+    confirm(title: string) { confirms.push(title); return Promise.resolve(answers.confirm?.(title) ?? false); },
+    select(title: string, options: string[]) { confirms.push(title); return Promise.resolve(answers.confirm?.(title) ? options.at(-1) : options[0]); },
+    editor(title: string, prefill?: string) { return Promise.resolve(answers.editor?.(title, prefill)); },
   };
   return {
     cwd,
@@ -67,11 +80,16 @@ function makeContext(
   } as unknown as ExtensionCommandContext;
 }
 
-function replacementContext(cwd: string, manager: SessionManager, messages: unknown[]): ExtensionCommandContext & { sendMessage: (message: unknown) => Promise<void> } {
+function replacementContext(
+  cwd: string,
+  manager: SessionManager,
+  messages: unknown[],
+  notifications: Array<{ message: string; level: string }> = [],
+): ExtensionCommandContext & { sendMessage: (message: unknown) => Promise<void> } {
   return {
     cwd,
     sessionManager: manager,
-    ui: { setStatus() {}, notify() {} },
+    ui: { setStatus() {}, notify(message: string, level: string) { notifications.push({ message, level }); } },
     sendMessage: async (message: unknown) => { messages.push(message); },
   } as unknown as ExtensionCommandContext & { sendMessage: (message: unknown) => Promise<void> };
 }
@@ -82,7 +100,7 @@ test("registers commands and switches from the exact non-final active leaf using
   process.env.PI_CODING_AGENT_SESSION_DIR = fixture.sessions;
   try {
     const { commands, events } = registerExtension();
-    assert.deepEqual([...commands.keys()].sort(), ["worktree", "worktree-exit", "worktree-list", "worktree-remove", "worktree-switch"]);
+    assert.deepEqual([...commands.keys()].sort(), ["worktree", "worktree-exit", "worktree-list", "worktree-merge", "worktree-remove", "worktree-switch"]);
     assert.ok(events.has("session_start"));
     assert.ok(events.has("session_shutdown"));
 
@@ -95,14 +113,22 @@ test("registers commands and switches from the exact non-final active leaf using
     const confirms: string[] = [];
     const replacementMessages: unknown[] = [];
     let switchedFile = "";
+    const replacementNotifications: Array<{ message: string; level: string }> = [];
     const switchSession: ExtensionCommandContext["switchSession"] = async (targetFile, options) => {
       switchedFile = targetFile;
       const target = SessionManager.open(targetFile);
-      await options?.withSession?.(replacementContext(target.getCwd(), target, replacementMessages) as never);
+      await options?.withSession?.(replacementContext(target.getCwd(), target, replacementMessages, replacementNotifications) as never);
       return { cancelled: false };
     };
     const ctx = makeContext(fixture.repo, source, notifications, switchSession, confirms);
+    await writeFile(join(fixture.repo, "README.md"), "uncommitted\n");
     await commands.get("worktree")?.handler("exact-leaf", ctx);
+    await runGit(["checkout", "--", "README.md"], fixture.repo);
+    // Creation warnings reach the replacement session, which is the one the user sees.
+    assert.deepEqual(notifications, []);
+    assert.equal(replacementNotifications.length, 1);
+    assert.equal(replacementNotifications[0]?.level, "warning");
+    assert.match(replacementNotifications[0]?.message ?? "", /origin\/HEAD.*Uncommitted changes in .* stay there/);
 
     assert.ok(switchedFile, JSON.stringify(notifications));
     const target = SessionManager.open(switchedFile);
@@ -110,7 +136,7 @@ test("registers commands and switches from the exact non-final active leaf using
     assert.equal(transition?.type, "custom");
     assert.equal(transition?.parentId, selectedLeaf);
     assert.equal(target.getCwd(), join(fixture.repo, ".pi", "worktrees", "exact-leaf"));
-    // The clone stays in the custom session directory so `pi -w` (pi --continue) resumes it.
+    // The clone stays in the custom session directory so `pi --continue` from the worktree resumes it.
     assert.equal(join(switchedFile, ".."), fixture.sessions);
     assert.equal(SessionManager.continueRecent(target.getCwd(), fixture.sessions).getSessionFile(), switchedFile);
     assert.equal(replacementMessages.length, 1);
@@ -237,7 +263,12 @@ test("worktree list hides invalid metadata records", { concurrency: false }, asy
     assert.deepEqual(notifications, [{ message: "worktree: listed, branch: worktree-listed", level: "info" }]);
 
     await commands.get("worktree-remove")?.handler("listed", ctx);
-    assert.deepEqual(notifications.at(-1), { message: "Removed worktree: listed, branch: worktree-listed. Branch was retained.", level: "info" });
+    assert.deepEqual(notifications.at(-1), { message: "Deleted worktree listed and branch worktree-listed.", level: "info" });
+
+    // A record whose checkout and branch are already gone is cleaned up too.
+    await commands.get("worktree-remove")?.handler("stale", ctx);
+    assert.deepEqual(notifications.at(-1), { message: "Deleted worktree stale.", level: "info" });
+    await assert.rejects(stat(join(records, "stale.json")), /ENOENT/);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -332,6 +363,182 @@ test("worktree works from a brand-new session before Pi writes its file", { conc
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+function sessionDirEnv(sessions: string): () => void {
+  const previous = process.env.PI_CODING_AGENT_SESSION_DIR;
+  process.env.PI_CODING_AGENT_SESSION_DIR = sessions;
+  return () => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_SESSION_DIR;
+    else process.env.PI_CODING_AGENT_SESSION_DIR = previous;
+  };
+}
+
+async function commitIn(cwd: string, file: string, content: string, message: string): Promise<void> {
+  await writeFile(join(cwd, file), content);
+  await runGit(["add", file], cwd);
+  await runGit(["commit", "-m", message], cwd);
+}
+
+const noSwitch: ExtensionCommandContext["switchSession"] = async () => { throw new Error("unexpected session switch"); };
+
+test("worktree-remove asks before discarding work and --force skips asking", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    const wt = await prepareWorktree(fixture.repo, "doomed", { trustProject: false, home: fixture.home });
+    await commitIn(wt.record.path, "work.txt", "work\n", "Work");
+    await writeFile(join(wt.record.path, "draft.txt"), "draft\n");
+    const { commands } = registerExtension();
+    const notifications: Array<{ message: string; level: string }> = [];
+    const confirms: string[] = [];
+    const manager = SessionManager.create(fixture.repo, fixture.sessions);
+
+    await commands.get("worktree-list")?.handler("", makeContext(fixture.repo, manager, notifications, noSwitch, confirms));
+    assert.deepEqual(notifications.at(-1), { message: "worktree: doomed, branch: worktree-doomed (uncommitted changes)", level: "info" });
+
+    await commands.get("worktree-remove")?.handler("doomed", makeContext(fixture.repo, manager, notifications, noSwitch, confirms));
+    assert.deepEqual(confirms, ["Delete worktree doomed? It has 1 uncommitted file change and 1 commit that no other branch contains. This cannot be undone."]);
+    assert.deepEqual(notifications.at(-1), { message: "Kept worktree doomed.", level: "info" });
+    assert.equal(await readFile(join(wt.record.path, "draft.txt"), "utf8"), "draft\n");
+
+    await commands.get("worktree-remove")?.handler("doomed --bogus", makeContext(fixture.repo, manager, notifications, noSwitch, confirms));
+    assert.deepEqual(notifications.at(-1), { message: "Unknown option --bogus", level: "error" });
+
+    await commands.get("worktree-remove")?.handler("--force doomed", makeContext(fixture.repo, manager, notifications, noSwitch, confirms));
+    assert.equal(confirms.length, 1);
+    assert.deepEqual(notifications.at(-1), { message: "Deleted worktree doomed and branch worktree-doomed.", level: "info" });
+    await assert.rejects(stat(wt.record.path), /ENOENT/);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-doomed"], fixture.repo));
+
+    const kept = await prepareWorktree(fixture.repo, "confirmed", { trustProject: false, home: fixture.home });
+    await writeFile(join(kept.record.path, "draft.txt"), "draft\n");
+    const yes = makeContext(fixture.repo, manager, notifications, noSwitch, confirms, { confirm: () => true });
+    await commands.get("worktree-remove")?.handler("confirmed", yes);
+    assert.deepEqual(notifications.at(-1), { message: "Deleted worktree confirmed and branch worktree-confirmed.", level: "info" });
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree-merge from the main checkout commits, squashes, and deletes the worktree", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  const restore = sessionDirEnv(fixture.sessions);
+  try {
+    const wt = await prepareWorktree(fixture.repo, "outside", { trustProject: false, home: fixture.home });
+    await commitIn(wt.record.path, "one.txt", "one\n", "Add one");
+    await writeFile(join(wt.record.path, "two.txt"), "two\n");
+    const { commands } = registerExtension();
+    const notifications: Array<{ message: string; level: string }> = [];
+    const confirms: string[] = [];
+    const editorCalls: Array<{ title: string; prefill: string | undefined }> = [];
+    const manager = SessionManager.create(fixture.repo, fixture.sessions);
+    const before = (await runGit(["rev-parse", "HEAD"], fixture.repo)).stdout.trim();
+
+    // Cancelling the message editor changes nothing, not even the worktree's uncommitted files.
+    const branchBefore = (await runGit(["rev-parse", "worktree-outside"], fixture.repo)).stdout.trim();
+    const cancel = makeContext(fixture.repo, manager, notifications, noSwitch, [], { confirm: () => true, editor: () => "" });
+    await commands.get("worktree-merge")?.handler("outside", cancel);
+    assert.deepEqual(notifications.at(-1), { message: "Merge cancelled; nothing was changed.", level: "info" });
+    assert.equal((await runGit(["rev-parse", "HEAD"], fixture.repo)).stdout.trim(), before);
+    assert.equal((await runGit(["rev-parse", "worktree-outside"], fixture.repo)).stdout.trim(), branchBefore);
+    assert.equal((await runGit(["status", "--porcelain"], wt.record.path)).stdout, "?? two.txt\n");
+
+    const ctx = makeContext(fixture.repo, manager, notifications, noSwitch, confirms, {
+      confirm: () => true,
+      editor: (title, prefill) => { editorCalls.push({ title, prefill }); return "Outside work\n"; },
+    });
+    await commands.get("worktree-merge")?.handler("outside", ctx);
+    assert.deepEqual(confirms, ["Commit changes in outside?"]);
+    assert.deepEqual(editorCalls, [{
+      title: "Squash worktree-outside into main: commit message",
+      // The automatic "Uncommitted changes" commit is left out, so the one real commit's message is offered.
+      prefill: "Add one",
+    }]);
+    const done = notifications.at(-1);
+    assert.equal(done?.level, "info", JSON.stringify(notifications));
+    assert.match(done?.message ?? "", /^Squash-merged worktree-outside into main as [0-9a-f]{12}\. Deleted worktree outside and branch worktree-outside\.$/);
+    assert.equal((await runGit(["log", "-1", "--format=%B"], fixture.repo)).stdout.trim(), "Outside work");
+    assert.equal((await runGit(["rev-parse", "HEAD^"], fixture.repo)).stdout.trim(), before);
+    assert.equal(await readFile(join(fixture.repo, "two.txt"), "utf8"), "two\n");
+    await assert.rejects(stat(wt.record.path), /ENOENT/);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-outside"], fixture.repo));
+  } finally {
+    restore();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree-merge conflicts leave main alone and move the conflict into the worktree", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    const wt = await prepareWorktree(fixture.repo, "clash", { trustProject: false, home: fixture.home });
+    await commitIn(wt.record.path, "README.md", "worktree\n", "Worktree edit");
+    await commitIn(fixture.repo, "README.md", "main\n", "Main edit");
+    const before = (await runGit(["rev-parse", "HEAD"], fixture.repo)).stdout.trim();
+    const { commands } = registerExtension();
+    const notifications: Array<{ message: string; level: string }> = [];
+    const confirms: string[] = [];
+    const ctx = makeContext(fixture.repo, SessionManager.create(fixture.repo, fixture.sessions), notifications, noSwitch, confirms, {
+      confirm: () => true,
+      editor: (_title, prefill) => prefill,
+    });
+
+    await commands.get("worktree-merge")?.handler("clash", ctx);
+    assert.deepEqual(confirms, ["Conflicts merging clash"]);
+    assert.deepEqual(notifications.at(-1), {
+      message: "Started merging main into worktree clash. Resolve the conflicts in README.md there. Use /worktree-switch clash to work on them, commit the resolution, then run /worktree-merge clash again.",
+      level: "warning",
+    });
+    assert.equal((await runGit(["rev-parse", "HEAD"], fixture.repo)).stdout.trim(), before);
+    assert.equal((await runGit(["status", "--porcelain"], fixture.repo)).stdout, "");
+    assert.match(await readFile(join(wt.record.path, "README.md"), "utf8"), /<<<<<<<[\s\S]*>>>>>>>/);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree-merge from inside the worktree returns to the main checkout before deleting it", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  const restore = sessionDirEnv(fixture.sessions);
+  try {
+    const wt = await prepareWorktree(fixture.repo, "inside", { trustProject: false, home: fixture.home });
+    await commitIn(wt.record.path, "inside.txt", "inside\n", "Inside work");
+    const { commands, events } = registerExtension();
+    const notifications: Array<{ message: string; level: string }> = [];
+    const confirms: string[] = [];
+    const replacementMessages: unknown[] = [];
+
+    const source = SessionManager.create(wt.record.path, fixture.sessions);
+    source.appendMessage({ role: "assistant", content: [] } as never);
+    const worktreeCtx = makeContext(wt.record.path, source, notifications, noSwitch, confirms);
+    await events.get("session_start")?.({ type: "session_start", reason: "resume" }, worktreeCtx);
+    assert.deepEqual((await listLiveLeases(wt.repo.commonDir, "inside")).map((lease) => lease.pid), [process.pid]);
+
+    let switchedCwd = "";
+    const exitSwitch: ExtensionCommandContext["switchSession"] = async (path, options) => {
+      const replacementManager = SessionManager.open(path);
+      switchedCwd = replacementManager.getCwd();
+      // Pi runs the replacement's session_start before withSession.
+      await events.get("session_start")?.({ type: "session_start", reason: "resume" }, makeContext(switchedCwd, replacementManager, notifications, noSwitch, confirms));
+      await options?.withSession?.(replacementContext(switchedCwd, replacementManager, replacementMessages) as never);
+      return { cancelled: false };
+    };
+    const ctx = makeContext(wt.record.path, source, notifications, exitSwitch, confirms, { editor: (_title, prefill) => prefill });
+    await commands.get("worktree-merge")?.handler("", ctx);
+
+    assert.deepEqual(notifications.filter((n) => n.level !== "info"), []);
+    assert.equal(switchedCwd, fixture.repo);
+    assert.equal((await runGit(["log", "-1", "--format=%s"], fixture.repo)).stdout.trim(), "Inside work");
+    await assert.rejects(stat(wt.record.path), /ENOENT/);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-inside"], fixture.repo));
+    assert.equal(replacementMessages.length, 1);
+    const message = JSON.stringify(replacementMessages[0]);
+    assert.match(message, /Revalidate all filesystem paths/);
+    assert.match(message, /Squash-merged worktree-inside into main as [0-9a-f]{12}\. Deleted worktree inside and branch worktree-inside\./);
+  } finally {
+    restore();
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

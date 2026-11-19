@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 
 export type BaseMode = "fresh" | "head";
 
@@ -41,28 +41,6 @@ export async function loadConfig(primaryRoot: string, trustProject: boolean, hom
   const globalConfig = await readOptional(join(home, ".pi", "agent", "worktree.json"));
   const projectConfig = trustProject ? await readOptional(join(primaryRoot, ".pi", "worktree.json")) : {};
   return { base: projectConfig.base ?? globalConfig.base ?? "fresh" };
-}
-
-/** Read Pi's persisted trust decision without modifying user configuration. */
-export async function isPersistentlyTrusted(primaryRoot: string, home = homedir()): Promise<boolean> {
-  const trustPath = join(home, ".pi", "agent", "trust.json");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(await readFile(trustPath, "utf8"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw new Error(`Cannot read Pi project trust from ${trustPath}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
-  const decisions = parsed as Record<string, unknown>;
-  let current = primaryRoot;
-  while (true) {
-    if (decisions[current] === true) return true;
-    if (decisions[current] === false) return false;
-    const parent = dirname(current);
-    if (parent === current) return false;
-    current = parent;
-  }
 }
 
 export const testing = { parseConfig };

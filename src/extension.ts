@@ -2,20 +2,34 @@ import { rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { createLease, removeLease } from "./leases.js";
+import {
+  bringTargetIntoWorktree,
+  commitWorktreeChanges,
+  defaultSquashMessage,
+  planMerge,
+  squashMerge,
+  type MergePlan,
+} from "./merge.js";
 import { reportCmuxCwd, reportTerminalCwd } from "./terminal.js";
 import {
+  describeLoss,
   findCurrentManaged,
   findManaged,
   formatWorktreeIdentity,
   listManaged,
+  planRemoval,
   prepareWorktree,
+  removalSnapshot,
   removeManaged,
   resolveRepository,
   rollbackCreated,
   type PreparedWorktree,
+  type RemovalResult,
+  type RemovalSnapshot,
 } from "./worktrees.js";
 
 const STATUS_KEY = "pi-worktree";
+const KEEP_LABEL = "Keep it";
 const TRANSITION_TYPE = "pi-worktree-transition";
 const ACTIVE_LEASE_STATE = Symbol.for("pi-worktree-extension.active-lease");
 
@@ -99,12 +113,25 @@ async function removeTargetSession(targetFile: string): Promise<string | undefin
   }
 }
 
+type ReplacementContext = Parameters<NonNullable<NonNullable<Parameters<ExtensionCommandContext["switchSession"]>[1]>["withSession"]>>[0];
+
+interface TransitionOptions {
+  prepared?: PreparedWorktree;
+  sourceLeaseName?: string;
+  targetLeaseName?: string;
+  /**
+   * Runs in the replacement session, after its session_start, before the transition message.
+   * Whatever it returns is appended to that message so the model sees what happened.
+   */
+  afterSwitch?: (replacement: ReplacementContext) => Promise<string | undefined>;
+}
+
 async function buildSessionTransition(
   ctx: ExtensionCommandContext,
   source: SourceState,
   targetCwd: string,
   kind: "enter" | "exit",
-  options: { prepared?: PreparedWorktree; sourceLeaseName?: string; targetLeaseName?: string } = {},
+  options: TransitionOptions = {},
 ): Promise<() => Promise<void>> {
   const targetManager = await forkSession(source, targetCwd);
   if (source.leaf === null) targetManager.resetLeaf();
@@ -122,14 +149,24 @@ async function buildSessionTransition(
   // Only immutable strings and prepared repository data cross the runtime replacement.
   const oldCwd = source.cwd;
   const newCwd = targetCwd;
+  // Resolved now because afterSwitch may delete the source checkout.
+  const commonDir = options.prepared?.repo.commonDir ?? (await resolveRepository(source.cwd)).commonDir;
   return async () => {
     const result = await ctx.switchSession(targetFile, {
       withSession: async (replacement) => {
         replacement.ui.setStatus(STATUS_KEY, kind === "enter" ? `worktree: ${newCwd.split("/").at(-1) ?? newCwd}` : undefined);
+        let note: string | undefined;
+        if (options.afterSwitch) {
+          try { note = await options.afterSwitch(replacement); }
+          catch (error) {
+            note = errorMessage(error);
+            replacement.ui.notify(note, "error");
+          }
+        }
         await replacement.sendMessage(
           {
             customType: TRANSITION_TYPE,
-            content: `Pi worktree transition: cwd changed from ${oldCwd} to ${newCwd}. Revalidate all filesystem paths, repository state, and cwd-dependent assumptions before continuing.`,
+            content: `Pi worktree transition: cwd changed from ${oldCwd} to ${newCwd}. Revalidate all filesystem paths, repository state, and cwd-dependent assumptions before continuing.${note ? ` ${note}` : ""}`,
             display: true,
             details: { kind, from: oldCwd, to: newCwd },
           },
@@ -142,7 +179,7 @@ async function buildSessionTransition(
       const sessionError = await removeTargetSession(targetFile);
       let leaseError: string | undefined;
       if (options.targetLeaseName && options.targetLeaseName !== options.sourceLeaseName) {
-        try { await removeLease(options.prepared?.repo.commonDir ?? (await resolveRepository(source.cwd)).commonDir, options.targetLeaseName); }
+        try { await removeLease(commonDir, options.targetLeaseName); }
         catch (error) { leaseError = errorMessage(error); }
       }
 
@@ -173,7 +210,6 @@ async function buildSessionTransition(
 
     // The target transition lease is now the runtime lease. Release only a different source lease.
     if (options.sourceLeaseName && options.sourceLeaseName !== options.targetLeaseName) {
-      const commonDir = options.prepared?.repo.commonDir ?? (await resolveRepository(source.cwd)).commonDir;
       await removeLease(commonDir, options.sourceLeaseName).catch(() => undefined);
     }
     // On success the old ctx/runtime is stale. Intentionally do not use it again.
@@ -183,6 +219,50 @@ async function buildSessionTransition(
 async function runCommand(ctx: ExtensionCommandContext, action: () => Promise<void>): Promise<void> {
   try { await action(); }
   catch (error) { ctx.ui.notify(errorMessage(error), "error"); }
+}
+
+function parseNameAndFlags(args: string, knownFlags: readonly string[]): { name: string; flags: Set<string> } {
+  const flags = new Set<string>();
+  const names: string[] = [];
+  for (const part of args.split(/\s+/).filter((item) => item.length > 0)) {
+    if (knownFlags.includes(part)) flags.add(part);
+    else if (part.startsWith("-")) throw new Error(`Unknown option ${part}`);
+    else names.push(part);
+  }
+  if (names.length > 1) throw new Error(`Expected one worktree name, got: ${names.join(" ")}`);
+  return { name: names[0] ?? "", flags };
+}
+
+function describeRemoval(result: RemovalResult): string {
+  const branch = result.branchDeleted ? ` and branch ${result.record.branch}` : "";
+  const remote = result.remoteBranches.length > 0 ? ` Remote branch ${result.remoteBranches.join(", ")} was left in place.` : "";
+  return `Deleted worktree ${result.record.name}${branch}.${remote}`;
+}
+
+async function reportConflict(ctx: ExtensionCommandContext, plan: MergePlan, files: string[], inside: boolean): Promise<void> {
+  const { name, branch } = plan.record;
+  const conflict = `${branch} conflicts with ${plan.target} in ${files.join(", ")}. ${plan.target} was left unchanged.`;
+  const retry = inside
+    ? `Commit the resolution, then run /worktree-merge ${name} again.`
+    : `Use /worktree-switch ${name} to work on them, commit the resolution, then run /worktree-merge ${name} again.`;
+  if (!ctx.hasUI) {
+    ctx.ui.notify(`${conflict} To resolve them, merge ${plan.target} into the worktree and fix the conflicts there. ${retry}`, "warning");
+    return;
+  }
+  const bring = await ctx.ui.confirm(
+    `Conflicts merging ${name}`,
+    `${conflict} Merge ${plan.target} into the worktree so the conflicts can be resolved there?`,
+  );
+  if (!bring) {
+    ctx.ui.notify(conflict, "warning");
+    return;
+  }
+  const remaining = await bringTargetIntoWorktree(plan);
+  if (remaining.length === 0) {
+    ctx.ui.notify(`Merged ${plan.target} into worktree ${name} without conflicts. Run /worktree-merge ${name} again.`, "info");
+    return;
+  }
+  ctx.ui.notify(`Started merging ${plan.target} into worktree ${name}. Resolve the conflicts in ${remaining.join(", ")} there. ${retry}`, "warning");
 }
 
 export default function piWorktreeExtension(pi: ExtensionAPI): void {
@@ -199,11 +279,18 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
         const sourceRepo = await resolveRepository(source.cwd);
         sourceLeaseName = (await findCurrentManaged(sourceRepo))?.name;
         prepared = await prepareWorktree(source.cwd, name, { trustProject: ctx.isProjectTrusted(), leasePid: process.pid });
-        if (prepared.warning) ctx.ui.notify(prepared.warning, "warning");
+        const warning = prepared.warning;
         execute = await buildSessionTransition(ctx, source, prepared.record.path, "enter", {
           prepared,
           ...(sourceLeaseName ? { sourceLeaseName } : {}),
           targetLeaseName: prepared.record.name,
+          // Notifications sent before the switch are not shown once the session is replaced.
+          ...(warning ? {
+            afterSwitch: async (replacement: ReplacementContext) => {
+              replacement.ui.notify(warning, "warning");
+              return undefined;
+            },
+          } : {}),
         });
       } catch (error) {
         if (prepared) {
@@ -255,7 +342,7 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
     description: "List extension-managed Git worktrees",
     handler: async (_args, ctx) => runCommand(ctx, async () => {
       const listed = await listManaged(await resolveRepository(ctx.cwd));
-      const lines = listed.valid.map(({ record }) => formatWorktreeIdentity(record));
+      const lines = listed.valid.map(({ record, clean }) => `${formatWorktreeIdentity(record)}${clean ? "" : " (uncommitted changes)"}`);
       ctx.ui.notify(lines.length > 0 ? lines.join("\n") : "No extension-managed worktrees.", "info");
     }),
   });
@@ -279,13 +366,118 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("worktree-remove", {
-    description: "Remove an inactive clean managed worktree (branch is retained)",
+    description: "Delete a managed worktree and its branch (asks first if work would be lost; --force skips asking)",
     handler: async (args, ctx) => runCommand(ctx, async () => {
-      const name = args.trim();
-      if (!name) throw new Error("Usage: /worktree-remove <name>");
-      const removed = await removeManaged(await resolveRepository(ctx.cwd), name, ctx.cwd);
-      ctx.ui.notify(`Removed ${formatWorktreeIdentity(removed)}. Branch was retained.`, "info");
+      const { name, flags } = parseNameAndFlags(args, ["--force", "-f"]);
+      if (!name) throw new Error("Usage: /worktree-remove <name> [--force]");
+      const repo = await resolveRepository(ctx.cwd);
+      const plan = await planRemoval(repo, name, ctx.cwd);
+      const loss = describeLoss(plan);
+      let confirmed: RemovalSnapshot | undefined;
+      if (loss) {
+        if (flags.size === 0) {
+          if (!ctx.hasUI) throw new Error(`Worktree ${name} has ${loss}. Run /worktree-remove ${name} --force to delete it anyway.`);
+          // Pi's confirm dialog preselects Yes, so use a list whose first, preselected entry keeps the work.
+          const deleteLabel = `Delete worktree and branch ${plan.record.branch}`;
+          const choice = await ctx.ui.select(`Delete worktree ${name}? It has ${loss}. This cannot be undone.`, [KEEP_LABEL, deleteLabel]);
+          if (choice !== deleteLabel) {
+            ctx.ui.notify(`Kept worktree ${name}.`, "info");
+            return;
+          }
+        }
+        confirmed = removalSnapshot(plan);
+      }
+      const removed = await removeManaged(repo, name, ctx.cwd, confirmed ? { confirmed } : {});
+      ctx.ui.notify(describeRemoval(removed), "info");
     }),
+  });
+
+  pi.registerCommand("worktree-merge", {
+    description: "Squash-merge a managed worktree into the main checkout's branch, then delete the worktree and its branch",
+    handler: async (args, ctx) => {
+      let execute: (() => Promise<void>) | undefined;
+      let summary: string | undefined;
+      try {
+        await ctx.waitForIdle();
+        const { name: requested } = parseNameAndFlags(args, []);
+        const repo = await resolveRepository(ctx.cwd);
+        const current = await findCurrentManaged(repo);
+        const name = requested || current?.name;
+        if (!name) throw new Error("Usage: /worktree-merge <name>, or run /worktree-merge inside a managed worktree");
+        const inside = current?.name === name;
+
+        let plan = await planMerge(ctx.cwd, name);
+        const commitFirst = plan.dirtyFiles > 0;
+        // Every question is asked before anything is written, so cancelling changes nothing.
+        if (commitFirst && ctx.hasUI) {
+          const ok = await ctx.ui.confirm(
+            `Commit changes in ${name}?`,
+            plan.dirtyFiles === 1
+              ? `Worktree ${name} has 1 uncommitted file change. Commit it in the worktree so it is part of the merge?`
+              : `Worktree ${name} has ${plan.dirtyFiles} uncommitted file changes. Commit them in the worktree so they are part of the merge?`,
+          );
+          if (!ok) {
+            ctx.ui.notify("Merge cancelled; nothing was changed.", "info");
+            return;
+          }
+        }
+        let message = defaultSquashMessage(name, plan.commits);
+        if ((plan.commitCount > 0 || commitFirst) && ctx.hasUI) {
+          const edited = await ctx.ui.editor(`Squash ${plan.record.branch} into ${plan.target}: commit message`, message);
+          if (!edited?.trim()) {
+            ctx.ui.notify("Merge cancelled; nothing was changed.", "info");
+            return;
+          }
+          message = edited.trim();
+        }
+        if (commitFirst) {
+          await commitWorktreeChanges(plan.record);
+          plan = await planMerge(ctx.cwd, name);
+        }
+
+        if (plan.commitCount === 0) {
+          summary = `${plan.record.branch} had no commits that ${plan.target} lacks.`;
+        } else {
+          const result = await squashMerge(plan, message);
+          if (result.status === "conflict") {
+            await reportConflict(ctx, plan, result.files, inside);
+            return;
+          }
+          summary = result.status === "merged"
+            ? `Squash-merged ${plan.record.branch} into ${plan.target} as ${result.oid.slice(0, 12)}.`
+            : `${plan.target} already had every change from ${plan.record.branch}.`;
+        }
+
+        // Everything on the branch is now in the target, so deleting loses nothing as long as
+        // the branch and worktree are exactly as merged.
+        const merged: RemovalSnapshot = { branchOid: plan.branchOid, status: "" };
+        const doneSummary = summary;
+        if (!inside) {
+          const removed = await removeManaged(repo, name, ctx.cwd, { confirmed: merged });
+          ctx.ui.notify(`${doneSummary} ${describeRemoval(removed)}`, "info");
+          return;
+        }
+        // A session cannot delete the checkout it is running in, so move to the primary
+        // checkout first and delete from the replacement session.
+        const source = await captureSource(ctx);
+        execute = await buildSessionTransition(ctx, source, plan.repo.primaryRoot, "exit", {
+          sourceLeaseName: name,
+          afterSwitch: async (replacement) => {
+            const removed = await removeManaged(await resolveRepository(replacement.cwd), name, replacement.cwd, { confirmed: merged });
+            replacement.ui.notify(describeRemoval(removed), "info");
+            return `${doneSummary} ${describeRemoval(removed)}`;
+          },
+        });
+        // Reported before switching so the result is visible even if the switch is cancelled.
+        ctx.ui.notify(`${doneSummary} Returning to ${plan.repo.primaryRoot} to delete the worktree.`, "info");
+      } catch (error) {
+        // Once the merge has landed, say so: the error is only about cleaning up afterwards.
+        const cleanup = summary ? `${summary} The worktree was kept: ` : "";
+        ctx.ui.notify(`${cleanup}${errorMessage(error)}`, "error");
+        return;
+      }
+      await execute();
+    },
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -305,8 +497,8 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
       }
 
       ctx.ui.setStatus(STATUS_KEY, current ? `worktree: ${current.name}` : undefined);
-      // Pi keeps its process alive when sessions change cwd. Tell cmux about every
-      // replacement session, not only worktrees launched through `pi -w`.
+      // Pi keeps its process alive when sessions change cwd. Tell the terminal and cmux
+      // about every replacement session so new tabs open in the session's directory.
       if (ctx.mode === "tui") {
         reportTerminalCwd(ctx.cwd);
         void reportCmuxCwd(ctx.cwd);

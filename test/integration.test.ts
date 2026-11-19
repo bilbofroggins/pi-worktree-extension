@@ -1,17 +1,21 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
 import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import { createLease, removeLease } from "../src/leases.js";
+import { createLease, listLiveLeases, removeLease } from "../src/leases.js";
 import { recordPath, recordsDirectory } from "../src/metadata.js";
-import { listManaged, prepareWorktree, removeManaged, resolveRepository, rollbackCreated } from "../src/worktrees.js";
+import {
+  describeLoss,
+  listManaged,
+  planRemoval,
+  prepareWorktree,
+  removalSnapshot,
+  removeManaged,
+  resolveRepository,
+  rollbackCreated,
+} from "../src/worktrees.js";
 import { runGit } from "../src/git.js";
-
-const execFile = promisify(execFileCallback);
 
 async function makeRepository(): Promise<{ root: string; repo: string; home: string }> {
   const root = await realpath(await mkdtemp(join(tmpdir(), "pi-worktree-integration-")));
@@ -55,85 +59,110 @@ test("create, reuse, list, and remove use real Git worktrees", async () => {
     assert.equal(excludeAgain.split("\n").filter((line) => line === "/.pi/worktrees/").length, 1);
 
     const removed = await removeManaged(await resolveRepository(fixture.repo), "task-one", fixture.repo);
-    assert.equal(removed.branch, "worktree-task-one");
-    assert.equal(await runGit(["show-ref", "--verify", "refs/heads/worktree-task-one"], fixture.repo).then(() => true), true);
+    assert.equal(removed.record.branch, "worktree-task-one");
+    assert.equal(removed.branchDeleted, true);
+    assert.deepEqual(removed.remoteBranches, []);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-task-one"], fixture.repo));
     assert.equal((await runGit(["worktree", "list", "--porcelain", "-z"], fixture.repo)).stdout.includes(created.record.path), false);
+    await assert.rejects(readFile(recordPath(created.repo.commonDir, "task-one")), /ENOENT/);
+    // The name is immediately reusable because the branch went with the checkout.
+    assert.equal((await prepareWorktree(fixture.repo, "task-one", { trustProject: false, home: fixture.home })).created, true);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test("creation rejects a dirty source but reuse permits a dirty target", async () => {
+test("creation from a dirty source warns and leaves the source alone; reuse permits a dirty target", async () => {
   const fixture = await makeRepository();
   try {
     await writeFile(join(fixture.repo, "dirty.txt"), "dirty\n");
-    await assert.rejects(prepareWorktree(fixture.repo, "dirty-source", { trustProject: false, home: fixture.home }), /tracked or untracked changes/);
+    await writeFile(join(fixture.repo, "README.md"), "edited\n");
+    const fromDirty = await prepareWorktree(fixture.repo, "dirty-source", { trustProject: false, home: fixture.home });
+    assert.equal(fromDirty.created, true);
+    assert.match(fromDirty.warning ?? "", /Uncommitted changes in .* stay there/);
+    assert.equal(await readFile(join(fixture.repo, "dirty.txt"), "utf8"), "dirty\n");
+    assert.equal(await readFile(join(fixture.repo, "README.md"), "utf8"), "edited\n");
+    await assert.rejects(readFile(join(fromDirty.record.path, "dirty.txt")), /ENOENT/);
+    assert.equal(await readFile(join(fromDirty.record.path, "README.md"), "utf8"), "fixture\n");
     await rm(join(fixture.repo, "dirty.txt"));
+    await runGit(["checkout", "--", "README.md"], fixture.repo);
+
     const created = await prepareWorktree(fixture.repo, "reusable", { trustProject: false, home: fixture.home });
     await writeFile(join(created.record.path, "change.txt"), "keep me\n");
     const reused = await prepareWorktree(fixture.repo, "reusable", { trustProject: false, home: fixture.home });
     assert.equal(reused.created, false);
-    await assert.rejects(removeManaged(await resolveRepository(fixture.repo), "reusable", fixture.repo), /tracked changes or untracked files/);
+    await assert.rejects(removeManaged(await resolveRepository(fixture.repo), "reusable", fixture.repo), /1 uncommitted file change; nothing was removed/);
+    assert.equal(await readFile(join(created.record.path, "change.txt"), "utf8"), "keep me\n");
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test("startup launcher creates, reuses, changes cwd, and passes Pi arguments", async () => {
+test("removal reports lost work and deletes only the exact state that was confirmed", async () => {
   const fixture = await makeRepository();
+  const options = { trustProject: false, home: fixture.home };
   try {
-    const capture = join(fixture.root, "capture");
-    const fakePi = join(fixture.root, "real-pi");
-    await mkdir(capture);
-    await writeFile(fakePi, '#!/usr/bin/env bash\nprintf "%s" "$PWD" > "$CAPTURE/cwd"\nprintf "%s\\n" "$@" > "$CAPTURE/args"\n');
-    await chmod(fakePi, 0o755);
-    const launcher = join(process.cwd(), "bin", "pi-worktree");
-    const env: NodeJS.ProcessEnv = { ...process.env, HOME: fixture.home, CAPTURE: capture, PI_WORKTREE_REAL_PI: fakePi };
-    // Never let launcher tests report fixture paths to the developer's live cmux tab.
-    delete env.CMUX_SOCKET_PATH;
-    delete env.CMUX_SOCKET;
-    delete env.CMUX_TAB_ID;
-    delete env.CMUX_WORKSPACE_ID;
-    delete env.CMUX_PANEL_ID;
-    delete env.CMUX_SURFACE_ID;
-    const first = await execFile(launcher, ["startup", "--model", "provider/model"], { cwd: fixture.repo, env });
-    const target = join(fixture.repo, ".pi", "worktrees", "startup");
-    assert.match(first.stderr, /No network fetch was attempted/);
-    assert.equal(await readFile(join(capture, "cwd"), "utf8"), target);
-    assert.deepEqual((await readFile(join(capture, "args"), "utf8")).trim().split("\n"), ["--continue", "--model", "provider/model"]);
+    const created = await prepareWorktree(fixture.repo, "work", options);
+    const repo = await resolveRepository(fixture.repo);
+    await writeFile(join(created.record.path, "a.txt"), "a\n");
+    await runGit(["add", "a.txt"], created.record.path);
+    await runGit(["commit", "-m", "a"], created.record.path);
+    await writeFile(join(created.record.path, "b.txt"), "b\n");
 
-    const transcript = join(fixture.root, "terminal-output");
-    const ptyCapture = [
-      "import os, pty, sys",
-      "pid, fd = pty.fork()",
-      "if pid == 0: os.execv(sys.argv[2], sys.argv[2:])",
-      "chunks = []",
-      "while True:",
-      "  try: data = os.read(fd, 4096)",
-      "  except OSError: break",
-      "  if not data: break",
-      "  chunks.append(data)",
-      "_, status = os.waitpid(pid, 0)",
-      "open(sys.argv[1], 'wb').write(b''.join(chunks))",
-      "raise SystemExit(os.waitstatus_to_exitcode(status))",
-    ].join("\n");
-    await execFile("python3", ["-c", ptyCapture, transcript, launcher, "startup"], { cwd: fixture.repo, env });
-    const expectedCwdReport = `\x1b]7;${pathToFileURL(target).href}\x1b\\`;
-    assert.equal((await readFile(transcript, "utf8")).includes(expectedCwdReport), true);
+    const plan = await planRemoval(repo, "work", fixture.repo);
+    assert.equal(plan.uniqueCommits, 1);
+    assert.equal(plan.dirtyFiles, 1);
+    assert.equal(describeLoss(plan), "1 uncommitted file change and 1 commit that no other branch contains");
+    await assert.rejects(removeManaged(repo, "work", fixture.repo), /nothing was removed/);
 
-    // A relative real-Pi path is canonicalized before cwd changes.
-    await execFile(launcher, ["startup", "--thinking", "high"], {
-      cwd: fixture.repo,
-      env: { ...env, PI_WORKTREE_REAL_PI: "../real-pi" },
-    });
-    assert.equal(await readFile(join(capture, "cwd"), "utf8"), target);
-    assert.deepEqual((await readFile(join(capture, "args"), "utf8")).trim().split("\n"), ["--continue", "--thinking", "high"]);
+    // Anything that changes after the user agreed blocks removal.
+    await writeFile(join(created.record.path, "c.txt"), "c\n");
+    await assert.rejects(removeManaged(repo, "work", fixture.repo, { confirmed: removalSnapshot(plan) }), /changed after it was checked/);
+    assert.equal(await readFile(join(created.record.path, "c.txt"), "utf8"), "c\n");
 
-    // npm-style node_modules/.bin symlinks must resolve the physical package root.
-    assert.equal((await runGit(["status", "--porcelain=v1", "-z", "--untracked-files=all"], fixture.repo)).stdout, "");
-    const binDirectory = join(fixture.root, "consumer", "node_modules", ".bin");
-    await mkdir(binDirectory, { recursive: true });
-    const linkedLauncher = join(binDirectory, "pi-worktree");
-    await symlink(launcher, linkedLauncher);
-    await execFile(linkedLauncher, ["linked"], { cwd: fixture.repo, env });
-    assert.equal(await readFile(join(capture, "cwd"), "utf8"), join(fixture.repo, ".pi", "worktrees", "linked"));
-    await assert.rejects(readFile(join(fixture.home, ".pi", "agent", "worktree.json")), /ENOENT/);
+    const removed = await removeManaged(repo, "work", fixture.repo, { confirmed: removalSnapshot(await planRemoval(repo, "work", fixture.repo)) });
+    assert.equal(removed.branchDeleted, true);
+    await assert.rejects(lstat(created.record.path), /ENOENT/);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-work"], fixture.repo));
+
+    // Commits that a remote-tracking branch already holds are not "lost", and remote branches are kept.
+    const pushed = await prepareWorktree(fixture.repo, "pushed", options);
+    await writeFile(join(pushed.record.path, "p.txt"), "p\n");
+    await runGit(["add", "p.txt"], pushed.record.path);
+    await runGit(["commit", "-m", "p"], pushed.record.path);
+    await runGit(["update-ref", "refs/remotes/origin/worktree-pushed", "refs/heads/worktree-pushed"], fixture.repo);
+    assert.equal((await planRemoval(repo, "pushed", fixture.repo)).uniqueCommits, 0);
+    const removedPushed = await removeManaged(repo, "pushed", fixture.repo);
+    assert.deepEqual(removedPushed.remoteBranches, ["origin/worktree-pushed"]);
+    await runGit(["show-ref", "--verify", "refs/remotes/origin/worktree-pushed"], fixture.repo);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("removal refuses the active worktree and cleans up after a deleted checkout directory", async () => {
+  const fixture = await makeRepository();
+  const options = { trustProject: false, home: fixture.home };
+  try {
+    const active = await prepareWorktree(fixture.repo, "active", options);
+    const nested = join(active.record.path, "sub");
+    await mkdir(nested);
+    await assert.rejects(removeManaged(await resolveRepository(nested), "active", nested), /Run \/worktree-exit first/);
+
+    // Directory deleted by hand: Git still lists it (as prunable) until removal cleans it up.
+    const gone = await prepareWorktree(fixture.repo, "gone", options);
+    await rm(gone.record.path, { recursive: true, force: true });
+    const repo = await resolveRepository(fixture.repo);
+    const plan = await planRemoval(repo, "gone", fixture.repo);
+    assert.equal(plan.registered, true);
+    assert.equal(plan.checkoutPresent, false);
+    assert.equal(describeLoss(plan), undefined);
+    assert.equal((await removeManaged(repo, "gone", fixture.repo)).branchDeleted, true);
+    assert.equal((await runGit(["worktree", "list", "--porcelain"], fixture.repo)).stdout.includes(gone.record.path), false);
+    await assert.rejects(readFile(recordPath(repo.commonDir, "gone")), /ENOENT/);
+
+    // Directory deleted and already pruned from Git: only the branch and metadata remain.
+    const pruned = await prepareWorktree(fixture.repo, "pruned", options);
+    await rm(pruned.record.path, { recursive: true, force: true });
+    await runGit(["worktree", "prune"], fixture.repo);
+    const prunedPlan = await planRemoval(await resolveRepository(fixture.repo), "pruned", fixture.repo);
+    assert.equal(prunedPlan.registered, false);
+    assert.equal((await removeManaged(await resolveRepository(fixture.repo), "pruned", fixture.repo)).branchDeleted, true);
+    await assert.rejects(runGit(["show-ref", "--verify", "refs/heads/worktree-pruned"], fixture.repo));
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
@@ -158,14 +187,19 @@ test("ignored files match Git worktree removal behavior", async () => {
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
-test("a live process lease blocks removal and the owner can release only its lease", async () => {
+test("another live Pi process's lease blocks removal; this process's leftover lease does not", async () => {
   const fixture = await makeRepository();
   try {
     const prepared = await prepareWorktree(fixture.repo, "leased", { trustProject: false, home: fixture.home });
+    // The test runner's parent process stands in for another live Pi session.
+    await createLease(prepared.repo.commonDir, prepared.record.name, process.ppid);
+    await assert.rejects(removeManaged(await resolveRepository(fixture.repo), "leased", fixture.repo), new RegExp(`in use by another Pi session: PID ${process.ppid}`));
+    await removeLease(prepared.repo.commonDir, prepared.record.name, process.ppid);
+
+    // This process is outside the worktree, so its own lease is stale and is cleaned up.
     await createLease(prepared.repo.commonDir, prepared.record.name, process.pid);
-    await assert.rejects(removeManaged(await resolveRepository(fixture.repo), "leased", fixture.repo), new RegExp(`leased.*PID ${process.pid}`));
-    await removeLease(prepared.repo.commonDir, prepared.record.name, process.pid);
     await removeManaged(await resolveRepository(fixture.repo), "leased", fixture.repo);
+    assert.deepEqual(await listLiveLeases(prepared.repo.commonDir, "leased"), []);
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
 
