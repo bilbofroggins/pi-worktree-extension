@@ -23,6 +23,7 @@ import {
   removeManaged,
   resolveRepository,
   rollbackCreated,
+  NotARepositoryError,
   type PreparedWorktree,
   type RemovalResult,
   type RemovalSnapshot,
@@ -510,6 +511,8 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
       }
     } catch (error) {
       ctx.ui.setStatus(STATUS_KEY, undefined);
+      // Starting Pi outside a Git repository is normal; there is simply no lease to take.
+      if (error instanceof NotARepositoryError) return;
       ctx.ui.notify(`Worktree lease/status setup failed: ${errorMessage(error)}`, "warning");
     }
   });

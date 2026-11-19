@@ -47,10 +47,21 @@ export async function validateName(name: string, cwd: string): Promise<void> {
   await runGit(["check-ref-format", "--branch", `worktree-${name}`], cwd);
 }
 
+/**
+ * The cwd is not inside a Git repository at all. Callers that run on every session
+ * start treat this as "nothing to do" rather than a reportable failure.
+ */
+export class NotARepositoryError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NotARepositoryError";
+  }
+}
+
 export async function resolveRepository(cwd: string): Promise<RepositoryContext> {
   let bare: string;
   try { bare = (await runGit(["rev-parse", "--is-bare-repository"], cwd)).stdout.trim(); }
-  catch (error) { throw new Error(`Not inside a Git repository: ${error instanceof Error ? error.message : String(error)}`); }
+  catch (error) { throw new NotARepositoryError(`Not inside a Git repository: ${error instanceof Error ? error.message : String(error)}`); }
   if (bare === "true") throw new Error("Bare repositories are not supported");
 
   const sourceRoot = await canonicalExisting((await runGit(["rev-parse", "--show-toplevel"], cwd)).stdout.trim());

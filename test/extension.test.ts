@@ -584,3 +584,18 @@ test("worktree names are suggested as command arguments", { concurrency: false }
     await rm(fixture.root, { recursive: true, force: true });
   }
 });
+
+test("starting outside a Git repository stays silent", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    const { events } = registerExtension();
+    const notifications: Array<{ message: string; level: string }> = [];
+    await events.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      makeContext(fixture.home, SessionManager.create(fixture.home, fixture.sessions), notifications, noSwitch, []),
+    );
+    assert.deepEqual(notifications, []);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
