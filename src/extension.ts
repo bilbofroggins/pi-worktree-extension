@@ -1,6 +1,12 @@
 import { rm, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import {
+  CustomEditor,
+  getAgentDir,
+  SessionManager,
+  type ExtensionAPI,
+  type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
 import { createLease, removeLease } from "./leases.js";
 import { listRecords } from "./metadata.js";
 import {
@@ -241,6 +247,59 @@ interface CompletionItem {
   description?: string;
 }
 
+/** Structurally Pi's AutocompleteProvider, which lives in a package this one does not depend on. */
+interface ArgumentProvider {
+  triggerCharacters?: string[];
+  getSuggestions(
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    options: { signal: AbortSignal; force?: boolean | undefined },
+  ): Promise<{ items: CompletionItem[]; prefix: string } | null>;
+  applyCompletion(
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    item: CompletionItem,
+    prefix: string,
+  ): { lines: string[]; cursorLine: number; cursorCol: number };
+  shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
+}
+
+/** Commands whose argument Tab completion this extension supplies itself. */
+const ARGUMENT_COMMANDS = ["worktree", "worktree-remove", "worktree-merge"] as const;
+
+/** Tab as pi-tui delivers it, the default binding for `tui.input.tab`. */
+const TAB = "\t";
+
+/** True when `text` is one of our commands followed by exactly one space: the prompt for a name. */
+function isArgumentPrompt(text: string): boolean {
+  return ARGUMENT_COMMANDS.some((command) => text === `/${command} `);
+}
+
+/**
+ * Finish a worktree command in a single Tab.
+ *
+ * Tab on `/worktree-remove` only completes the command name and stops, because Pi deliberately does not
+ * chain command-name completion into argument completion (it would submit `/model`-style commands into
+ * their selector). That leaves `/worktree-remove ` with nothing open, so the user has to press Tab twice.
+ *
+ * Rather than change that rule for every command, apply the completion and then, if it landed on one of
+ * our own argument prompts, ask again immediately. The second request goes through
+ * `withArgumentTabCompletion`, which is what makes it open the name list instead of being swallowed.
+ */
+export class WorktreeEditor extends CustomEditor {
+  override handleInput(data: string): void {
+    if (data !== TAB || !this.isShowingAutocomplete()) {
+      super.handleInput(data);
+      return;
+    }
+    super.handleInput(data); // Apply the highlighted item: completes the command name.
+    const { line } = this.getCursor();
+    if (isArgumentPrompt(this.getLines()[line] ?? "")) super.handleInput(TAB);
+  }
+}
+
 /**
  * Suggest managed worktree names for the argument being typed.
  *
@@ -263,6 +322,48 @@ async function nameCompletions(cwd: string, typed: string, options: { includeCur
   } catch {
     return null; // Not in a repository, or unreadable metadata: just offer nothing.
   }
+}
+
+/**
+ * Let Tab open the worktree-name list right after the command name.
+ *
+ * Pi handles Tab in an argument position as a *forced file-path* completion: the editor asks
+ * `shouldTriggerFileCompletion` first, and the built-in provider answers `false` whenever the text
+ * before the cursor, once trimmed, is a slash command with no space left in it. A trailing space is
+ * exactly what `trim()` removes, so `/worktree-remove ` reads as "still typing the command name" and
+ * Tab is swallowed. Even when it is let through, `force` makes the provider skip its command-argument
+ * branch entirely and list directory entries instead.
+ *
+ * So answer `true` for our own commands' argument position, and rerun the request unforced so the
+ * built-in provider takes the argument branch and asks this extension for the names.
+ *
+ * This handles the case where the command name is already complete and the list is asked for directly.
+ * The other half — a single Tab on a fully typed `/worktree-remove`, where Pi stops after completing the
+ * name — is `WorktreeEditor`, which presses Tab a second time for us.
+ *
+ * Registering this once per `session_start` is safe: wrapping a wrapper is idempotent, and Pi clears
+ * its wrapper list (then re-invokes every extension factory) on reload and on each session switch. So
+ * registering unconditionally is what keeps the behaviour alive across `/worktree` switches; a
+ * once-per-module guard would leave Tab permanently dead for the rest of the process after the first
+ * switch, because the wrapper list is rebuilt while the extension instance is not.
+ */
+function withArgumentTabCompletion(current: ArgumentProvider, commands: readonly string[]): ArgumentProvider {
+  const argumentPosition = new RegExp(`^/(?:${commands.join("|")})\\s`);
+  return {
+    ...(current.triggerCharacters ? { triggerCharacters: current.triggerCharacters } : {}),
+    getSuggestions(lines, cursorLine, cursorCol, options) {
+      const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
+      const force = options.force === true && !argumentPosition.test(before);
+      return current.getSuggestions(lines, cursorLine, cursorCol, { ...options, force });
+    },
+    applyCompletion: (lines, cursorLine, cursorCol, item, prefix) =>
+      current.applyCompletion(lines, cursorLine, cursorCol, item, prefix),
+    shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+      const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
+      if (argumentPosition.test(before)) return true;
+      return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+    },
+  };
 }
 
 function describeRemoval(result: RemovalResult): string {
@@ -487,6 +588,13 @@ export default function piWorktreeExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionCwd = ctx.cwd;
+    if (typeof ctx.ui.addAutocompleteProvider === "function") {
+      ctx.ui.addAutocompleteProvider((current) => withArgumentTabCompletion(current, ARGUMENT_COMMANDS));
+    }
+    // Only claim the editor when nobody else has: replacing another extension's editor would undo it.
+    if (typeof ctx.ui.setEditorComponent === "function" && ctx.ui.getEditorComponent?.() === undefined) {
+      ctx.ui.setEditorComponent((tui, theme, keybindings) => new WorktreeEditor(tui, theme, keybindings));
+    }
     try {
       const repo = await resolveRepository(ctx.cwd);
       const current = await findCurrentManaged(repo);

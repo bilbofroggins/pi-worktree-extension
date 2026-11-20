@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, readFile, realpath, rm, stat, unlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import piWorktreeExtension from "../src/extension.js";
+import piWorktreeExtension, { WorktreeEditor } from "../src/extension.js";
 import { runGit } from "../src/git.js";
 import { listLiveLeases } from "../src/leases.js";
 import { prepareWorktree, resolveRepository } from "../src/worktrees.js";
@@ -16,15 +16,42 @@ interface RegisteredCommand {
 
 type EventHandler = (event: unknown, ctx: ExtensionCommandContext) => Promise<void>;
 
-function registerExtension(): { commands: Map<string, RegisteredCommand>; events: Map<string, EventHandler> } {
+/** Structurally Pi's AutocompleteProvider, which pi-worktree does not depend on at runtime. */
+interface FakeProvider {
+  triggerCharacters?: string[];
+  getSuggestions: (
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    options: { signal: AbortSignal; force?: boolean },
+  ) => Promise<{ items: Array<{ value: string; label: string }>; prefix: string } | null>;
+  applyCompletion: (
+    lines: string[],
+    cursorLine: number,
+    cursorCol: number,
+    item: { value: string; label: string },
+    prefix: string,
+  ) => { lines: string[]; cursorLine: number; cursorCol: number };
+  shouldTriggerFileCompletion?: (lines: string[], cursorLine: number, cursorCol: number) => boolean;
+}
+
+/** Structurally Pi's EditorFactory, used to observe whether the extension claims the editor. */
+type FakeEditorFactory = (...args: unknown[]) => unknown;
+
+function registerExtension(): {
+  commands: Map<string, RegisteredCommand>;
+  events: Map<string, EventHandler>;
+  autocompleteProviders: Array<(current: FakeProvider) => FakeProvider>;
+} {
   const commands = new Map<string, RegisteredCommand>();
   const events = new Map<string, EventHandler>();
+  const autocompleteProviders: Array<(current: FakeProvider) => FakeProvider> = [];
   const api = {
     registerCommand(name: string, command: RegisteredCommand) { commands.set(name, command); },
     on(name: string, handler: EventHandler) { events.set(name, handler); },
   };
   piWorktreeExtension(api as unknown as ExtensionAPI);
-  return { commands, events };
+  return { commands, events, autocompleteProviders };
 }
 
 async function makeRepository(): Promise<{ root: string; repo: string; home: string; sessions: string }> {
@@ -61,10 +88,16 @@ function makeContext(
   switchSession: ExtensionCommandContext["switchSession"],
   confirms: string[],
   answers: DialogAnswers = {},
+  autocompleteProviders: Array<(current: FakeProvider) => FakeProvider> = [],
+  editorComponents: FakeEditorFactory[] = [],
 ): ExtensionCommandContext {
   const ui = {
     notify(message: string, level: string) { notifications.push({ message, level }); },
     setStatus() {},
+    addAutocompleteProvider(factory: (current: FakeProvider) => FakeProvider) { autocompleteProviders.push(factory); },
+    setEditorComponent(factory: FakeEditorFactory) { editorComponents.push(factory); },
+    // Report whatever was installed last so a test can assert the extension claimed the editor once.
+    getEditorComponent: () => editorComponents.at(-1),
     confirm(title: string) { confirms.push(title); return Promise.resolve(answers.confirm?.(title) ?? false); },
     select(title: string, options: string[]) { confirms.push(title); return Promise.resolve(answers.confirm?.(title) ? options.at(-1) : options[0]); },
     editor(title: string, prefill?: string) { return Promise.resolve(answers.editor?.(title, prefill)); },
@@ -585,6 +618,81 @@ test("worktree names are suggested as command arguments", { concurrency: false }
   }
 });
 
+/**
+ * Pi treats Tab in an argument position as a forced file-path completion: `shouldTriggerFileCompletion`
+ * gates it, and `force` makes the built-in provider skip its command-argument branch. A trailing space
+ * is trimmed away by that gate, so `/worktree-remove ` looked like an unfinished command name and Tab
+ * did nothing. These assertions pin the wrapper that fixes it.
+ */
+test("Tab after a worktree command name opens the name list instead of file paths", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    await prepareWorktree(fixture.repo, "alpha", { trustProject: false, home: fixture.home });
+    const { commands, events, autocompleteProviders } = registerExtension();
+    const start = async (cwd: string) => events.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      makeContext(cwd, SessionManager.create(cwd, fixture.sessions), [], noSwitch, [], {}, autocompleteProviders),
+    );
+    await start(fixture.repo);
+
+    // Stand in for Pi's built-in provider: it refuses forced file completion for a bare command name
+    // and only offers argument completions when the request is not forced.
+    const seen: Array<{ force: boolean | undefined; text: string }> = [];
+    const base: FakeProvider = {
+      async getSuggestions(lines, line, col, options) {
+        const before = (lines[line] ?? "").slice(0, col);
+        seen.push({ force: options.force, text: before });
+        const space = before.indexOf(" ");
+        if (space === -1) return { prefix: before, items: [] };
+        const items = await commands.get(before.slice(1, space))?.getArgumentCompletions?.(before.slice(space + 1));
+        return items ? { prefix: before.slice(space + 1), items } : null;
+      },
+      applyCompletion: (lines) => ({ lines, cursorLine: 0, cursorCol: 0 }),
+      shouldTriggerFileCompletion: (lines, line, col) =>
+        !((lines[line] ?? "").slice(0, col).trim().startsWith("/") && !((lines[line] ?? "").slice(0, col).trim().includes(" "))),
+    };
+
+    assert.equal(autocompleteProviders.length, 1, "one wrapper per session_start");
+    const wrapped = autocompleteProviders[0]?.(base);
+    assert.ok(wrapped);
+
+    // Re-registering is safe and required: Pi clears its wrapper list on every session switch while
+    // keeping the extension instance, so a once-only guard would leave Tab dead after the first switch.
+    await start(fixture.repo);
+    assert.equal(autocompleteProviders.length, 2, "each session_start registers again");
+    const stacked = await autocompleteProviders[1]?.(wrapped)?.getSuggestions(["/worktree-remove "], 0, 17, {
+      signal: new AbortController().signal,
+      force: true,
+    });
+    assert.deepEqual(stacked?.items.map((item) => item.value), ["alpha"], "stacking wrappers is idempotent");
+
+    // Tab with a completed command name: the gate must open, and the request must arrive unforced.
+    assert.equal(wrapped.shouldTriggerFileCompletion?.(["/worktree-remove "], 0, 17), true);
+    const suggested = await wrapped.getSuggestions(["/worktree-remove "], 0, 17, { signal: new AbortController().signal, force: true });
+    assert.deepEqual(suggested?.items.map((item) => item.value), ["alpha"]);
+    assert.deepEqual(seen.at(-1), { force: false, text: "/worktree-remove " });
+
+    // Every command that takes a worktree name gets the same treatment.
+    for (const command of ["worktree", "worktree-merge"]) {
+      const line = `/${command} `;
+      assert.equal(wrapped.shouldTriggerFileCompletion?.([line], 0, line.length), true, command);
+      await wrapped.getSuggestions([line], 0, line.length, { signal: new AbortController().signal, force: true });
+      assert.equal(seen.at(-1)?.force, false, command);
+    }
+
+    // Unrelated commands and plain paths keep the built-in behaviour.
+    assert.equal(wrapped.shouldTriggerFileCompletion?.(["/model "], 0, 7), false);
+    assert.equal(wrapped.shouldTriggerFileCompletion?.(["note "], 0, 5), true);
+    await wrapped.getSuggestions(["/model "], 0, 7, { signal: new AbortController().signal, force: true });
+    assert.equal(seen.at(-1)?.force, true);
+    // A forced Tab before any space still means "complete this command name", not an argument.
+    await wrapped.getSuggestions(["/worktree-remove"], 0, 16, { signal: new AbortController().signal, force: true });
+    assert.equal(seen.at(-1)?.force, true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("starting outside a Git repository stays silent", { concurrency: false }, async () => {
   const fixture = await makeRepository();
   try {
@@ -595,6 +703,105 @@ test("starting outside a Git repository stays silent", { concurrency: false }, a
       makeContext(fixture.home, SessionManager.create(fixture.home, fixture.sessions), notifications, noSwitch, []),
     );
     assert.deepEqual(notifications, []);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+/**
+ * Tab on a fully typed worktree command must reach the name list in one press.
+ *
+ * Pi applies the highlighted command name and stops there (it deliberately does not chain into
+ * argument completion, which is what keeps `/model`-style commands working), so the editor has to
+ * ask again itself. This pins both halves: our commands chain, other commands do not.
+ */
+test("one Tab on a completed worktree command chains straight to the name list", { concurrency: false }, async () => {
+  const fixture = await makeRepository();
+  try {
+    // Two worktrees: with a single match pi-tui auto-applies it (editor.js:1992), which would hide the
+    // open list this test is about.
+    await prepareWorktree(fixture.repo, "zzalpha", { trustProject: false, home: fixture.home });
+    await prepareWorktree(fixture.repo, "zzbravo", { trustProject: false, home: fixture.home });
+    const { commands, events, autocompleteProviders } = registerExtension();
+    const start = async (cwd: string) => events.get("session_start")?.(
+      { type: "session_start", reason: "startup" },
+      makeContext(cwd, SessionManager.create(cwd, fixture.sessions), [], noSwitch, [], {}, autocompleteProviders),
+    );
+    await start(fixture.repo);
+
+    // The wrapper the extension installs, over a stand-in for Pi's built-in provider that behaves like
+    // the real one: forced requests are refused for a bare command name, unforced space-terminated ones
+    // are answered from the command's own argument completions.
+    const base: FakeProvider = {
+      async getSuggestions(lines, line, col, options) {
+        const before = (lines[line] ?? "").slice(0, col);
+        if (options.force && !before.includes(" ")) return null;
+        const space = before.indexOf(" ");
+        // No space yet: the command-name list, as Pi's combined provider does for `/prefix`.
+        // Real prefix is the trimmed command text INCLUDING the slash (dist/autocomplete.js:259).
+        if (space === -1) {
+          // "model" stands in for Pi's built-in commands, which this extension does not own.
+          const names = [...commands.keys(), "model"].filter((name) => name.startsWith(before.slice(1)));
+          return { prefix: before, items: names.map((name) => ({ value: name, label: name })) };
+        }
+        const items = await commands.get(before.slice(1, space))?.getArgumentCompletions?.(before.slice(space + 1));
+        return items ? { prefix: before.slice(space + 1), items } : null;
+      },
+      // Mirrors pi-tui's applyCompletion (dist/autocomplete.js:290): a command-name selection becomes
+      // `/<name> `, an argument selection replaces the typed argument with no trailing space added.
+      applyCompletion: (lines, line, col, item, prefix) => {
+        const currentLine = lines[line] ?? "";
+        const beforePrefix = currentLine.slice(0, col - prefix.length);
+        const afterCursor = currentLine.slice(col);
+        const next = [...lines];
+        // Command names get the "/" and a trailing space added (dist/autocomplete.js:300-311).
+        if (prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/")) {
+          next[line] = `${beforePrefix}/${item.value} ${afterCursor}`;
+          return { lines: next, cursorLine: line, cursorCol: beforePrefix.length + item.value.length + 2 };
+        }
+        // Command arguments replace only the typed argument, with no added space (line 329-341).
+        next[line] = `${beforePrefix}${item.value}${afterCursor}`;
+        return { lines: next, cursorLine: line, cursorCol: beforePrefix.length + item.value.length };
+      },
+      shouldTriggerFileCompletion: (lines, line, col) =>
+        !((lines[line] ?? "").slice(0, col).trim().startsWith("/") && !((lines[line] ?? "").slice(0, col).trim().includes(" "))),
+    };
+    const provider = autocompleteProviders[0]?.(base);
+    assert.ok(provider);
+
+    // Fake keybindings: only Tab is ever consulted, and the editor only reaches them via super.
+    const editor = new WorktreeEditor(
+      { requestRender() {}, terminal: { columns: 120, rows: 40 } } as never,
+      { borderColor: (text: string) => text } as never,
+      { matches: (data: string, action: string) => action === "tui.input.tab" && data === "\t" } as never,
+    );
+    editor.setAutocompleteProvider(provider);
+
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
+    const type = async (text: string) => {
+      for (const char of text) { editor.handleInput(char); await settle(); }
+    };
+
+    // The command-name list is open before the single Tab under test.
+    await type("/worktree-remove");
+    assert.equal(editor.isShowingAutocomplete(), true, "command names are offered first");
+    editor.handleInput("\t");
+    await settle();
+    assert.equal(editor.getText(), "/worktree-remove ", "one Tab completes the name and its trailing space");
+    assert.equal(editor.isShowingAutocomplete(), true, "and the argument list is already open");
+    // The open list holds worktree names, not directory entries: accepting it yields the worktree.
+    editor.handleInput("\t");
+    await settle();
+    assert.equal(editor.getText(), "/worktree-remove zzalpha", "the list offers a managed worktree");
+
+    // A command this extension does not own must NOT chain into an argument list.
+    editor.setText("");
+    await type("/model");
+    assert.equal(editor.isShowingAutocomplete(), true);
+    editor.handleInput("\t");
+    await settle();
+    assert.equal(editor.getText(), "/model ", "unrelated commands still stop at the name");
+    assert.equal(editor.isShowingAutocomplete(), false, "and nothing chains into an argument list");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
